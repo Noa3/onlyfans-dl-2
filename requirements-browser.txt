@@ -1,0 +1,3 @@
+# Optional: needed only for the visible Browser login helper.
+# Afterwards run: python -m playwright install chromium
+playwright>=1.57,<2
