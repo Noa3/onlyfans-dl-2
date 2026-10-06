@@ -1,14 +1,15 @@
 # OnlyFans DL — Desktop 2.0.3
 
+This tool downloads all photos/videos from OnlyFans profiles, creating a local archive.
+You must be subscribed to the profile to download their content.
+
 A local desktop UI and CLI built on the supplied `onlyfans-dl.py`. The old
 edit-the-constants workflow is gone: you set up a session in a form, pick creators
 and filters, watch progress, and a separate, testable download engine does the work.
 
 **Use your own account and only content you are entitled and permitted to save.**
 This is an unofficial client. It does not bypass access controls, DRM, or security
-challenges. No live authenticated OnlyFans login or download was performed when this
-package was built — current signing rules and API behavior may require further
-adjustment. See [TEST_REPORT.md](TEST_REPORT.md).
+challenges.
 
 **Extract the entire folder.** Keep `onlyfans-dl.py`, the `ofdl/` package, and the
 other files together. The launcher is not a standalone replacement file.
