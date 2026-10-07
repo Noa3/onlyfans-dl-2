@@ -1,4 +1,4 @@
-# OnlyFans DL — Desktop 2.0.3
+# OnlyFans DL — Desktop 2.1.0
 
 This tool downloads all photos/videos from OnlyFans profiles, creating a local archive.
 You must be subscribed to the profile to download their content.
@@ -13,6 +13,23 @@ challenges.
 
 **Extract the entire folder.** Keep `onlyfans-dl.py`, the `ofdl/` package, and the
 other files together. The launcher is not a standalone replacement file.
+
+## What's new in 2.1.0
+
+- **Dark mode.** A **Dark mode / Light mode** button in the top-right header recolors the
+  whole window instantly and is remembered in your saved preferences.
+- **Automatic session load.** A checkbox on the Session tab loads your saved session from
+  the OS credential store when the app starts. It stays quiet if nothing is saved and
+  never writes a plaintext session file.
+- **Scheduled new-content checks.** On Downloads, **Check for new content automatically**
+  re-runs a download every 1–10080 minutes while the window stays open. It never starts
+  the app for you and skips silently when setup or the session is not ready.
+- **Overall progress with ETA.** A third progress bar shows discovery/paging, then the
+  download-queue percentage with an estimated time to finish, above the existing per-run
+  and per-file bars.
+- **Roomier Activity preview.** The log is compacted and the Latest media preview area now
+  expands to fill the window, with the **Open file** button pinned so it is always visible.
+- The old "A local interface for your own account…" header subtitle was removed.
 
 ## What's new in 2.0.3
 
@@ -129,10 +146,17 @@ actually works depends on current API responses and your account's access.
 (it still contacts the account/API and may update the nonsecret rules cache). **Start
 download** scans, builds a deduplicated queue, then transfers files.
 
+**Check for new content automatically** re-runs a download every 1–10080 minutes, but only
+while this window stays open — it never registers an OS autostart and skips silently when
+the session or options are not ready. The Activity tab reports progress on three bars: the
+**overall** pipeline (discovery/paging, then queue percentage and estimated time to
+finish), the per-run file count, and the current file with transfer speed.
+
 **Pause/Resume** and **Stop** are cooperative; an in-flight request may finish or time out
 first. Use **Save preferences** to retain output folder, creators, filters, layout options,
-browser choice, rules source, and creator/date modes. Session values are never saved, and
-settings are not saved automatically.
+browser choice, rules source, creator/date modes, the theme, the session-autoload choice,
+and the automatic-check interval. Session values are never saved, and settings are not
+saved automatically.
 
 ### Existing files and compatibility
 
@@ -182,8 +206,10 @@ preferences, the rules cache, the manifest, logs, or any plaintext session file.
 **Save session securely** explicitly stores to a supported OS credential store via
 `keyring` (Windows, macOS, Secret Service, KWallet); unsupported/plaintext backends are
 refused. **Load saved** loads on demand; **Forget saved** deletes the entry; **Clear
-fields** clears the form but not the saved entry. None of these revoke the server
-session — use the website's account/security controls for that.
+fields** clears the form but not the saved entry. **Load the saved session automatically
+when the app starts** performs that load at launch; it stays quiet if nothing is saved.
+None of these revoke the server session — use the website's account/security controls for
+that.
 
 Nonsecret settings and the rules cache live under:
 

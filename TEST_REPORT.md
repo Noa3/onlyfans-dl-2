@@ -1,12 +1,12 @@
-# Verification report — Desktop 2.0.3
+# Verification report — Desktop 2.1.0
 
-Build date: 2026-10-06. This report covers local/offline verification of the Activity
-preview and legacy-file compatibility update. It is not evidence of live platform/API
-compatibility or a formal security audit.
+Build date: 2026-10-07. This report covers local/offline verification of the dark-mode,
+session-autoload, scheduled-check and overall-progress update. It is not evidence of live
+platform/API compatibility or a formal security audit.
 
 ## Results
 
-**163 tests passed; 0 failures, 0 errors, 0 skipped** under Xvfb with a real Tk event
+**168 tests passed; 0 failures, 0 errors, 0 skipped** under Xvfb with a real Tk event
 loop. `python -m compileall -q ofdl onlyfans-dl.py tests` also completed successfully.
 
 | Area | Coverage |
@@ -17,6 +17,10 @@ loop. `python -m compileall -q ofdl onlyfans-dl.py tests` also completed success
 | Manifest migration | Deferred legacy records are flushed/persisted on close; downloaded files retain normal immediate recording |
 | Preview helper | Image thumbnail size/source preservation, missing-file handling, lightweight no-ffmpeg video fallback |
 | Preview integration | Download completion event, no preview event for legacy adoption, actual Tk right-side preview panel and asynchronous event delivery |
+| Theme | Light/dark palette switch applies to the window and persists in preferences |
+| Session autoload | Autoload preference persists; scheduled/quiet behavior is regression-checked |
+| Automatic checks | Interval scheduling and cancellation when disabled or invalid |
+| Overall progress | Pipeline scan/download/done events drive the new bar, percentage and ETA; header subtitle removed |
 
 The new regressions were run before implementation and failed for the expected missing
 behaviors: old non-current layouts caused a media request, no media-complete event was
@@ -86,4 +90,4 @@ On headless Linux with Xvfb:
 xvfb-run -a python -m unittest discover -s tests -v
 ```
 
-Expected complete run for this package: `Ran 163 tests` followed by `OK`.
+Expected complete run for this package: `Ran 168 tests` followed by `OK`.

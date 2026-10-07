@@ -9,6 +9,7 @@ from tempfile import TemporaryDirectory
 from pathlib import Path
 from ofdl.auth import Credentials
 from ofdl.common import AppError, Cancelled, Control
+from ofdl.settings import load_preferences
 try:
     from ofdl.browser import credentials_from_response, capture_context
     from ofdl.ui import App
@@ -309,6 +310,67 @@ class UITests(unittest.TestCase):
         button_bottom = button.winfo_rooty() + button.winfo_height()
         tab_bottom = self.app.activity_tab.winfo_rooty() + self.app.activity_tab.winfo_height()
         self.assertLessEqual(button_bottom, tab_bottom)
+
+    def pump(self, seconds=.4):
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            self.root.update()
+            time.sleep(.01)
+
+    def test_header_drops_old_subtitle(self):
+        labels = [str(w.cget('text')) for w in self.app.header.winfo_children() if w.winfo_class() == 'Label']
+        self.assertFalse(any('local interface' in text.lower() for text in labels))
+        self.assertTrue(any('DOWNLOADER' in text for text in labels))
+
+    def test_theme_toggle_switches_palette_and_persists(self):
+        from ofdl.ui import DARK_PALETTE
+        self.assertEqual(self.app.theme_mode.get(), 'light')
+        self.app.toggle_theme()
+        self.root.update()
+        self.assertEqual(self.app.theme_mode.get(), 'dark')
+        self.assertEqual(self.app.root.cget('bg'), DARK_PALETTE['window_bg'])
+        self.assertEqual(self.app.theme_button.cget('text'), 'Light mode')
+        self.assertEqual(load_preferences(self.app.preferences_path).get('theme'), 'dark')
+        self.app.toggle_theme()
+        self.root.update()
+        self.assertEqual(self.app.theme_mode.get(), 'light')
+
+    def test_autoload_preference_persists(self):
+        self.assertFalse(self.app.autoload_session.get())
+        self.app.autoload_session.set(True)
+        self.root.update()
+        self.assertTrue(load_preferences(self.app.preferences_path).get('autoload_session'))
+        self.app.autoload_session.set(False)
+
+    def test_auto_check_schedules_and_cancels(self):
+        self.app.auto_check.set(True)
+        self.app.auto_check_interval.set('5')
+        self.root.update()
+        self.assertIsNotNone(self.app._auto_check_id)
+        self.app.auto_check_interval.set('0')
+        self.root.update()
+        self.assertIsNone(self.app._auto_check_id)
+        self.app.auto_check_interval.set('30')
+        self.root.update()
+        self.app.auto_check.set(False)
+        self.root.update()
+        self.assertIsNone(self.app._auto_check_id)
+
+    def test_pipeline_events_drive_overall_bar_and_eta(self):
+        self.app.events.put(('pipeline', {'stage': 'scan'}))
+        self.pump()
+        self.assertEqual(str(self.app.pipeline_progress.cget('mode')), 'indeterminate')
+        self.app.events.put(('pipeline', {'stage': 'download', 'total': 10}))
+        self.pump()
+        self.app.pipeline_started = time.monotonic() - 5
+        self.app.events.put(('overall', {'done': 2, 'total': 10}))
+        self.pump()
+        self.assertIn('20%', self.app.pipeline_status.get())
+        self.assertIn('ETA', self.app.pipeline_status.get())
+        self.assertEqual(self.app.overall_status.get(), 'Files: 2/10 complete')
+        self.app.events.put(('pipeline', {'stage': 'done'}))
+        self.pump()
+        self.assertEqual(self.app.pipeline_status.get(), 'Overall progress: finished')
 
     def test_media_complete_event_updates_preview_without_blocking_poll(self):
         media = Path(self.temp.name)/'done.jpg'

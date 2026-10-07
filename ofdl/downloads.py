@@ -667,6 +667,7 @@ def run_downloads(client: ApiClient, options: Options, control: Control,
     summary = RunSummary()
     queue: dict[str,MediaTask] = {}
     owners: dict[str,str] = {}
+    emit('pipeline',{'stage':'scan'})
     emit('phase','Scanning accessible content')
     # Validate account access once before enumerating creators.
     client.user('me')
@@ -771,12 +772,15 @@ def run_downloads(client: ApiClient, options: Options, control: Control,
         emit('phase','Scan finished; no media downloaded')
         for task in queue.values():
             emit('log',f'Planned: {task.relative_path(options)}')
+        emit('pipeline',{'stage':'done'})
         return summary
     if not queue:
         emit('phase','No downloadable media found')
+        emit('pipeline',{'stage':'done'})
         return summary
     control.checkpoint()
     emit('phase','Downloading')
+    emit('pipeline',{'stage':'download','total':len(queue)})
     with FolderLock(options.output_dir):
         manifest = Manifest(options.output_dir)
         worker = Downloader(options,client.auth.user_agent,control,manifest,emit=emit)
@@ -807,4 +811,5 @@ def run_downloads(client: ApiClient, options: Options, control: Control,
             worker.close()
             manifest.close()
     emit('phase','Finished with issues' if summary.errors else 'Finished')
+    emit('pipeline',{'stage':'done'})
     return summary

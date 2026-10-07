@@ -7,6 +7,7 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 import webbrowser
 from datetime import datetime, timedelta, timezone
@@ -49,7 +50,7 @@ SESSION STORAGE
 
 Private fields are hidden again after import, clearing fields, or starting Test session. Turn off Show private values before screenshots. A failed/stopped test is not ready; changed inputs need a new test.
 
-By default the session remains in this running app's memory and is discarded on exit (Python/OS memory is not guaranteed to be securely erased). Save session uses a supported operating-system credential store. Plaintext fallback is refused. Load saved reads it on demand. Forget saved removes that saved entry; Clear fields removes the in-memory form. Neither action revokes the server session—use the website's account/security controls to do that.
+By default the session remains in this running app's memory and is discarded on exit (Python/OS memory is not guaranteed to be securely erased). Save session uses a supported operating-system credential store. Plaintext fallback is refused. Load saved reads it on demand. Forget saved removes that saved entry; Clear fields removes the in-memory form. Neither action revokes the server session—use the website's account/security controls to do that. The "Load the saved session automatically when the app starts" checkbox loads that saved entry at launch and stays quiet if nothing is saved.
 
 Preferences and rules cache are nonsecret, but profile names, output paths, local filenames, and the media manifest are still private metadata. Protect your device and backups. Other software running as your OS user may be able to access the keychain. The application has no telemetry or hosted authentication service.
 
@@ -65,7 +66,9 @@ Completed files are atomically renamed from .part files. Interrupted files resum
 
 A local .ofdl.sqlite3 manifest avoids repeated downloads of the same media across content categories. Exact old paths are checked first. Only after an exact miss does a lazy per-creator metadata scan look for original flat/category/album layouts and the original gifs/ folder; file contents are not hashed or decoded for duplicate detection. Each creator tree is indexed at most once per run, and legacy manifest writes are batched. Full files and optional previews have distinct identities/names. Already indexed files are checked for matching size, not cryptographically re-hashed. Do not run two copies against the same download folder. The folder lock is acquired when writing starts.
 
-Activity shows the newest newly completed media on the right. Image/GIF thumbnails are reduced in a background worker. For videos, a single poster frame is attempted only when ffmpeg is already available in PATH; otherwise a lightweight video placeholder is shown. Existing/legacy files are not previewed during adoption, avoiding thousands of thumbnail jobs on a large first migration. Open file always uses the operating system's normal viewer/player.
+Activity shows the newest newly completed media on the right. Image/GIF thumbnails are reduced in a background worker. For videos, a single poster frame is attempted only when ffmpeg is already available in PATH; otherwise a lightweight video placeholder is shown. Existing/legacy files are not previewed during adoption, avoiding thousands of thumbnail jobs on a large first migration. Open file always uses the operating system's normal viewer/player. Three progress bars run in the footer: the overall pipeline (discovery/paging, then queue percentage with an estimated time to finish), the per-run file count, and the current file with transfer speed. The header button switches between light and dark mode.
+
+Optional automatic checks on the Downloads tab re-run a download every chosen number of minutes, but only while this window stays open; they never register an OS autostart and skip silently when the session or options are not ready.
 
 Scan only makes account/API requests, but no media downloads or output-folder writes. It lists candidate files before existing-file checks, so its planned count is not a count of new downloads. Stop/pause are cooperative; an in-flight network operation may need to finish or hit its timeout first. Discovery happens before downloading, so the overall file total is unknown during the scan.
 
@@ -99,6 +102,33 @@ def readable_bytes(value: float) -> str:
     return ''
 
 
+def format_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds >= 3600:
+        return f'{seconds // 3600}h {seconds % 3600 // 60:02d}m'
+    if seconds >= 60:
+        return f'{seconds // 60}m {seconds % 60:02d}s'
+    return f'{seconds}s'
+
+
+LIGHT_PALETTE = {
+    'window_bg':'#f3f5f8','text':'#243447','muted':'#5d6d7e','heading':'#15263b',
+    'border':'#d9e0e8','field':'#ffffff','field_disabled':'#e8edf2','field_disabled_text':'#7c8996',
+    'button_bg':'#e4eaf0','button_active':'#d4e0eb','button_text':'#243447',
+    'accent':'#1769aa','accent_active':'#125b95','accent_disabled':'#afc1cf','accent_disabled_text':'#f1f4f7',
+    'header_bg':'#15263b','header_text':'#ffffff','header_muted':'#bfcedd',
+    'canvas':'#f3f5f8','progress_trough':'#e2e8ef','tab_bg':'#e4eaf0','tab_selected':'#ffffff',
+}
+DARK_PALETTE = {
+    'window_bg':'#1e2229','text':'#e6e9ee','muted':'#9aa4b2','heading':'#f5f7fa',
+    'border':'#3a4149','field':'#2a2f37','field_disabled':'#242830','field_disabled_text':'#6b7480',
+    'button_bg':'#2f353d','button_active':'#3a424c','button_text':'#e6e9ee',
+    'accent':'#3b82f6','accent_active':'#2f6fd6','accent_disabled':'#33415a','accent_disabled_text':'#7d8aa0',
+    'header_bg':'#11151a','header_text':'#ffffff','header_muted':'#9aa4b2',
+    'canvas':'#1e2229','progress_trough':'#2a2f37','tab_bg':'#2a2f37','tab_selected':'#1e2229',
+}
+
+
 class App:
     def __init__(self, root: tk.Tk, *, preferences_path: Path | None = None):
         self.root = root
@@ -108,6 +138,7 @@ class App:
         self.events: queue.Queue[tuple[str,Any]] = queue.Queue()
         self.success_callback: Callable[[Any],None] | None = None
         self.task_title = ''
+        self.task_quiet = False
         self.closing = False
         self.poll_id: str | None = None
         self.imported_auth: Credentials | None = None
@@ -138,8 +169,19 @@ class App:
         self.date_mode = tk.StringVar(root,'All dates')
         self.flags = {name:tk.BooleanVar(root,name != 'previews') for name in
                       ('photos','videos','audio','albums','subfolders','previews',*CATEGORIES)}
-        self._style()
+        self.theme_mode = tk.StringVar(root,'light')
+        self.autoload_session = tk.BooleanVar(root,False)
+        self.auto_check = tk.BooleanVar(root,False)
+        self.auto_check_interval = tk.StringVar(root,'30')
+        self.pipeline_status = tk.StringVar(root,'Overall progress: idle')
+        self.overall_status = tk.StringVar(root,'Files: idle')
+        self._loading = False
+        self._auto_check_id: str | None = None
+        self.pipeline_started = 0.0
+        self.pipeline_total = 0
+        self._apply_theme()
         self._build()
+        self._apply_theme()
         self.preview_thread = threading.Thread(target=self._preview_loop,name='ofdl-preview',daemon=True)
         self.preview_thread.start()
         self._load_preferences()
@@ -151,42 +193,87 @@ class App:
         self._update_creator_summary()
         for var in [*self.auth_vars.values(), self.rules_source]:
             var.trace_add('write', self._session_inputs_changed)
+        self.auto_check.trace_add('write', self._auto_check_changed)
+        self.auto_check_interval.trace_add('write', self._auto_check_changed)
+        self.autoload_session.trace_add('write', lambda *a: self._persist_silently())
+        self._reschedule_auto_check()
+        if self.autoload_session.get():
+            root.after(300, self._autoload_session)
         root.protocol('WM_DELETE_WINDOW',self.close)
         root.bind('<Destroy>',self._on_destroy,add='+')
         self.poll_id = root.after(80,self._poll)
 
-    def _style(self):
+    def _apply_theme(self):
+        p = DARK_PALETTE if self.theme_mode.get() == 'dark' else LIGHT_PALETTE
         self.root.title(f'OnlyFans DL · Desktop {__version__}')
-        width = min(1060,max(950,self.root.winfo_screenwidth()-60))
-        height = min(850,max(620,self.root.winfo_screenheight()-80))
-        self.root.geometry(f'{width}x{height}')
-        self.root.minsize(950,620)
-        self.root.configure(bg='#f3f5f8')
+        if not getattr(self,'_geometry_set',False):
+            width = min(1060,max(950,self.root.winfo_screenwidth()-60))
+            height = min(850,max(620,self.root.winfo_screenheight()-80))
+            self.root.geometry(f'{width}x{height}')
+            self.root.minsize(950,620)
+            self._geometry_set = True
+        family = 'Segoe UI' if os.name == 'nt' else 'DejaVu Sans'
+        self.root.configure(bg=p['window_bg'])
         style = ttk.Style(self.root)
         style.theme_use('clam')
-        family = 'Segoe UI' if os.name == 'nt' else 'DejaVu Sans'
         self.root.option_add('*Font',(family,10))
-        style.configure('.',font=(family,10),background='#f3f5f8',foreground='#243447')
-        style.configure('TFrame',background='#f3f5f8')
-        style.configure('TLabel',background='#f3f5f8')
-        style.configure('Muted.TLabel',foreground='#5d6d7e')
-        style.configure('Heading.TLabel',font=(family,17,'bold'),foreground='#15263b')
-        style.configure('TLabelframe',background='#f3f5f8',bordercolor='#d9e0e8')
-        style.configure('TLabelframe.Label',font=(family,10,'bold'),foreground='#1e3b56')
-        style.configure('TButton',padding=(12,7),background='#e4eaf0',borderwidth=0)
-        style.map('TButton',background=[('active','#d4e0eb'),('disabled','#edf0f3')])
-        style.configure('Accent.TButton',background='#1769aa',foreground='white',font=(family,10,'bold'))
-        style.map('Accent.TButton',background=[('active','#125b95'),('disabled','#afc1cf')],foreground=[('disabled','#f1f4f7')])
-        style.configure('TEntry',fieldbackground='white',padding=5)
-        style.map('TEntry', fieldbackground=[('disabled', '#e8edf2')],
-                  foreground=[('disabled', '#7c8996')])
-        style.configure('TSpinbox', fieldbackground='white', padding=5)
-        style.map('TSpinbox', fieldbackground=[('disabled', '#e8edf2')],
-                  foreground=[('disabled', '#7c8996')])
-        style.configure('TNotebook',background='#f3f5f8',borderwidth=0)
-        style.configure('TNotebook.Tab',padding=(22,10),background='#e4eaf0')
-        style.map('TNotebook.Tab',background=[('selected','#ffffff')],foreground=[('selected','#1769aa')])
-        style.configure('Horizontal.TProgressbar',background='#1769aa',troughcolor='#e2e8ef',borderwidth=0)
+        style.configure('.',font=(family,10),background=p['window_bg'],foreground=p['text'])
+        style.configure('TFrame',background=p['window_bg'])
+        style.configure('TLabel',background=p['window_bg'],foreground=p['text'])
+        style.configure('Muted.TLabel',background=p['window_bg'],foreground=p['muted'])
+        style.configure('Heading.TLabel',font=(family,17,'bold'),background=p['window_bg'],foreground=p['heading'])
+        style.configure('TLabelframe',background=p['window_bg'],bordercolor=p['border'])
+        style.configure('TLabelframe.Label',font=(family,10,'bold'),background=p['window_bg'],foreground=p['heading'])
+        style.configure('TButton',padding=(12,7),background=p['button_bg'],foreground=p['button_text'],borderwidth=0)
+        style.map('TButton',background=[('active',p['button_active']),('disabled',p['field_disabled'])],
+                  foreground=[('disabled',p['field_disabled_text'])])
+        style.configure('Accent.TButton',background=p['accent'],foreground='white',font=(family,10,'bold'))
+        style.map('Accent.TButton',background=[('active',p['accent_active']),('disabled',p['accent_disabled'])],
+                  foreground=[('disabled',p['accent_disabled_text'])])
+        style.configure('TCheckbutton',background=p['window_bg'],foreground=p['text'])
+        style.map('TCheckbutton',background=[('active',p['window_bg'])],foreground=[('disabled',p['field_disabled_text'])])
+        style.configure('TRadiobutton',background=p['window_bg'],foreground=p['text'])
+        style.map('TRadiobutton',background=[('active',p['window_bg'])],foreground=[('disabled',p['field_disabled_text'])])
+        style.configure('TEntry',fieldbackground=p['field'],foreground=p['text'],insertcolor=p['text'],padding=5)
+        style.map('TEntry', fieldbackground=[('disabled', p['field_disabled'])],
+                  foreground=[('disabled', p['field_disabled_text'])])
+        style.configure('TSpinbox', fieldbackground=p['field'], foreground=p['text'], insertcolor=p['text'], padding=5)
+        style.map('TSpinbox', fieldbackground=[('disabled', p['field_disabled'])],
+                  foreground=[('disabled', p['field_disabled_text'])])
+        style.configure('TCombobox',fieldbackground=p['field'],foreground=p['text'],background=p['field'],
+                        arrowcolor=p['text'],selectbackground=p['field'],selectforeground=p['text'],
+                        bordercolor=p['border'],lightcolor=p['field'],darkcolor=p['field'])
+        style.map('TCombobox',fieldbackground=[('readonly',p['field']),('disabled',p['field_disabled'])],
+                  foreground=[('readonly',p['text']),('disabled',p['field_disabled_text'])],
+                  background=[('readonly',p['field'])])
+        for option in ('*TCombobox*Listbox.background','*TCombobox*Listbox.foreground'):
+            self.root.option_add(option,p['field'] if option.endswith('background') else p['text'])
+        self.root.option_add('*TCombobox*Listbox.selectBackground',p['accent'])
+        self.root.option_add('*TCombobox*Listbox.selectForeground','white')
+        style.configure('TNotebook',background=p['window_bg'],borderwidth=0)
+        style.configure('TNotebook.Tab',padding=(22,10),background=p['tab_bg'],foreground=p['text'])
+        style.map('TNotebook.Tab',background=[('selected',p['tab_selected'])],foreground=[('selected',p['accent'])])
+        for orient in ('Vertical','Horizontal'):
+            style.configure(f'{orient}.TScrollbar',background=p['button_bg'],troughcolor=p['window_bg'],
+                            bordercolor=p['border'],arrowcolor=p['text'])
+        style.configure('Horizontal.TProgressbar',background=p['accent'],troughcolor=p['progress_trough'],borderwidth=0)
+        if hasattr(self,'header'):
+            self.header.configure(bg=p['header_bg'])
+            self.header_title.configure(bg=p['header_bg'],fg=p['header_text'])
+            self.theme_button.configure(bg=p['header_bg'],fg=p['header_text'],
+                                        activebackground=p['header_bg'],activeforeground=p['header_text'],
+                                        text='Light mode' if self.theme_mode.get() == 'dark' else 'Dark mode')
+        for canvas in (getattr(self,'session_canvas',None),getattr(self,'downloads_canvas',None)):
+            if canvas is not None:
+                canvas.configure(bg=p['canvas'])
+        for widget in (getattr(self,'log_text',None),getattr(self,'help_text',None),getattr(self,'profiles_text',None)):
+            if widget is not None:
+                widget.configure(bg=p['field'],fg=p['text'],insertbackground=p['text'],selectbackground=p['accent'])
+
+    def toggle_theme(self):
+        self.theme_mode.set('light' if self.theme_mode.get() == 'dark' else 'dark')
+        self._apply_theme()
+        self._persist_silently()
 
     def button(self,parent,text,command,*,accent=False,busy=True,**pack):
         widget = ttk.Button(parent,text=text,command=command,style='Accent.TButton' if accent else 'TButton')
@@ -196,10 +283,17 @@ class App:
         return widget
 
     def _build(self):
-        header = tk.Frame(self.root,bg='#15263b',height=82)
-        header.pack(fill='x')
-        tk.Label(header,text='OF  /  DOWNLOADER',bg='#15263b',fg='white',font=('TkDefaultFont',20,'bold')).pack(anchor='w',padx=24,pady=(15,2))
-        tk.Label(header,text='A local interface for your own account · no source-code editing needed',bg='#15263b',fg='#bfcedd').pack(anchor='w',padx=25,pady=(0,16))
+        palette = DARK_PALETTE if self.theme_mode.get() == 'dark' else LIGHT_PALETTE
+        self.header = tk.Frame(self.root,bg=palette['header_bg'],height=82)
+        self.header.pack(fill='x')
+        self.header.pack_propagate(False)
+        self.theme_button = tk.Button(self.header,text='Dark mode',command=self.toggle_theme,
+                                      bg=palette['header_bg'],fg=palette['header_text'],relief='flat',
+                                      activebackground=palette['header_bg'],activeforeground=palette['header_text'],
+                                      borderwidth=0,highlightthickness=0,cursor='hand2',font=('TkDefaultFont',10,'bold'))
+        self.theme_button.pack(side='right',padx=22)
+        self.header_title = tk.Label(self.header,text='OF  /  DOWNLOADER',bg=palette['header_bg'],fg=palette['header_text'],font=('TkDefaultFont',20,'bold'))
+        self.header_title.pack(side='left',padx=24)
         container = ttk.Frame(self.root,padding=(18,14,18,0))
         container.pack(fill='both',expand=True)
         self.tabs = ttk.Notebook(container)
@@ -219,14 +313,18 @@ class App:
         self._downloads_tab()
         self._activity_tab()
         self._help_tab()
-        footer = ttk.Frame(self.root,padding=(24,12,24,18))
+        footer = ttk.Frame(self.root,padding=(24,8,24,10))
         footer.pack(side='bottom',fill='x',before=container)
         ttk.Label(footer,textvariable=self.status,font=('TkDefaultFont',11,'bold')).pack(anchor='w')
+        ttk.Label(footer,textvariable=self.pipeline_status,style='Muted.TLabel').pack(anchor='w',pady=(4,1))
+        self.pipeline_progress = ttk.Progressbar(footer,mode='determinate',maximum=100)
+        self.pipeline_progress.pack(fill='x')
+        ttk.Label(footer,textvariable=self.overall_status,style='Muted.TLabel').pack(anchor='w',pady=(4,1))
         self.overall_progress = ttk.Progressbar(footer,mode='determinate',maximum=100)
-        self.overall_progress.pack(fill='x',pady=(7,4))
-        ttk.Label(footer,textvariable=self.file_status,style='Muted.TLabel').pack(anchor='w')
+        self.overall_progress.pack(fill='x')
+        ttk.Label(footer,textvariable=self.file_status,style='Muted.TLabel').pack(anchor='w',pady=(4,1))
         self.file_progress = ttk.Progressbar(footer,mode='determinate',maximum=100)
-        self.file_progress.pack(fill='x',pady=(4,10))
+        self.file_progress.pack(fill='x',pady=(0,6))
         controls = ttk.Frame(footer)
         controls.pack(fill='x')
         self.button(controls,'Start download',lambda:self.start_download(False),accent=True,side='left')
@@ -292,6 +390,8 @@ class App:
         self.button(actions,'Load saved',self.load_keychain,side='left',padx=(8,0))
         self.button(actions,'Forget saved',self.forget_keychain,side='left',padx=(8,0))
         self.button(actions,'Clear fields',self.clear_fields,side='left',padx=(8,0))
+        ttk.Checkbutton(parent,text='Load the saved session automatically when the app starts',
+                        variable=self.autoload_session,command=self._persist_silently).pack(anchor='w',pady=(10,0))
         ttk.Label(parent,textvariable=self.session_status,style='Muted.TLabel',wraplength=900).pack(anchor='w',pady=(10,12))
         rules = ttk.LabelFrame(parent,text='Signing rules · independent of your login details',padding=12)
         rules.pack(fill='x')
@@ -370,6 +470,17 @@ class App:
         self.since_entry.pack(side='left')
         self.action_widgets.extend((self.date_choice, self.days_spinbox, self.since_entry))
         ttk.Label(parent,text='Existing files are skipped automatically. All dates is safest for repeat runs; it also catches media added to older posts.',wraplength=900,style='Muted.TLabel').pack(anchor='w',pady=(12,0))
+        auto = ttk.LabelFrame(parent,text='Automatic checks while the app is open',padding=12)
+        auto.pack(fill='x',pady=(12,0))
+        row = ttk.Frame(auto)
+        row.pack(fill='x')
+        ttk.Checkbutton(row,text='Check for new content automatically',variable=self.auto_check).pack(side='left')
+        ttk.Label(row,text='every').pack(side='left',padx=(14,6))
+        self.auto_check_spinbox = ttk.Spinbox(row,from_=1,to=10080,textvariable=self.auto_check_interval,width=6)
+        self.auto_check_spinbox.pack(side='left')
+        ttk.Label(row,text='minutes').pack(side='left',padx=(6,0))
+        ttk.Label(auto,text='Runs only while this window stays open; it never starts the app or a download that is not already configured. Default is 30 minutes.',
+                  style='Muted.TLabel',wraplength=900).pack(anchor='w',pady=(6,0))
         row = ttk.Frame(parent)
         row.pack(fill='x',pady=(12,0))
         self.button(row,'Save preferences',self.save_settings,side='left')
@@ -429,13 +540,13 @@ class App:
 
         content = ttk.Frame(parent)
         content.pack(fill='both',expand=True)
-        left = ttk.Frame(content)
-        left.pack(side='left',fill='both',expand=True)
-        right = ttk.Frame(content,width=330,padding=(16,0,0,0))
+        right = ttk.Frame(content,width=390,padding=(16,0,0,0))
         right.pack(side='right',fill='y')
         right.pack_propagate(False)
+        left = ttk.Frame(content)
+        left.pack(side='left',fill='both',expand=True)
 
-        self.log_text = scrolledtext.ScrolledText(left,wrap='word',state='disabled',font=('TkFixedFont',10),borderwidth=0,padx=12,pady=12)
+        self.log_text = scrolledtext.ScrolledText(left,wrap='word',state='disabled',width=40,height=20,font=('TkFixedFont',9),borderwidth=0,padx=10,pady=10)
         self.log_text.pack(fill='both',expand=True)
         row = ttk.Frame(left)
         row.pack(fill='x',pady=(12,0))
@@ -444,16 +555,17 @@ class App:
         ttk.Label(row,text='Logs omit session headers and signed download URLs.',style='Muted.TLabel').pack(side='right')
 
         ttk.Label(right,text='Latest media',font=('TkDefaultFont',11,'bold')).pack(anchor='w')
-        preview_box = ttk.Frame(right,height=210)
-        preview_box.pack(fill='x',pady=(10,10))
-        preview_box.pack_propagate(False)
+        # Bottom items are packed first so the Open button always stays visible; the
+        # preview frame expands to absorb whatever height the window offers.
+        self.preview_open_button = self.button(right,'Open file',self.open_preview,busy=False,side='bottom',anchor='w')
+        self.preview_open_button.state(['disabled'])
+        ttk.Label(right,textvariable=self.preview_status,style='Muted.TLabel',wraplength=360,justify='left').pack(side='bottom',anchor='w',pady=(8,10))
+        ttk.Label(right,textvariable=self.preview_details,style='Muted.TLabel',wraplength=360,justify='left').pack(side='bottom',anchor='w',pady=(5,0))
+        ttk.Label(right,textvariable=self.preview_title,font=('TkDefaultFont',10,'bold'),wraplength=360).pack(side='bottom',anchor='w')
+        preview_box = ttk.Frame(right)
+        preview_box.pack(fill='both',expand=True,pady=(10,10))
         self.preview_image_label = ttk.Label(preview_box,text='No preview yet',anchor='center',justify='center')
         self.preview_image_label.pack(fill='both',expand=True)
-        ttk.Label(right,textvariable=self.preview_title,font=('TkDefaultFont',10,'bold'),wraplength=300).pack(anchor='w')
-        ttk.Label(right,textvariable=self.preview_details,style='Muted.TLabel',wraplength=300,justify='left').pack(anchor='w',pady=(5,0))
-        ttk.Label(right,textvariable=self.preview_status,style='Muted.TLabel',wraplength=300,justify='left').pack(anchor='w',pady=(8,10))
-        self.preview_open_button = self.button(right,'Open file',self.open_preview,busy=False,side='top',anchor='w')
-        self.preview_open_button.state(['disabled'])
 
     def _help_tab(self):
         parent = self.help_tab
@@ -708,17 +820,32 @@ class App:
                        since=since,dry_run=scan_only,all_subscriptions=mode == 'all',
                        skip_profiles=excluded).validate()
 
-    def start_download(self,scan_only: bool):
+    def start_download(self,scan_only: bool,*,auto: bool=False):
         try:
             auth = self.get_auth()
             options = self.get_options(scan_only)
         except (AppError,SessionError) as exc:
+            if auto:
+                self.log(f'Automatic check skipped: {exc}')
+                self.status.set('Automatic check skipped · fix the setup and try again')
+                self._reschedule_auto_check()
+                return
             messagebox.showerror('Check setup',str(exc),parent=self.root)
             return
         source = self.rules_source.get().strip()
-        self.tabs.select(self.activity_tab)
+        if not auto:
+            self.tabs.select(self.activity_tab)
+        try:
+            self.pipeline_progress.stop()
+        except tk.TclError:
+            pass
+        self.pipeline_progress.configure(mode='determinate',value=0)
         self.overall_progress.configure(value=0)
         self.file_progress.configure(value=0)
+        self.pipeline_started = 0.0
+        self.pipeline_total = 0
+        self.pipeline_status.set('Overall progress: starting…')
+        self.overall_status.set('Files: discovering…')
         self.file_status.set('Discovering media before building the download queue')
         self.stats.set('Starting a new scan…')
         def run(control,emit):
@@ -729,15 +856,16 @@ class App:
             else:
                 self.status.set('Scan complete · no media downloaded' if scan_only else 'Download run finished')
             self.update_stats(summary.to_dict())
-        self.run_task('Scanning accessible media',run,completed)
+        self.run_task('Scanning accessible media',run,completed,quiet=auto)
 
-    def run_task(self,title: str,work: Callable,success: Callable | None = None):
+    def run_task(self,title: str,work: Callable,success: Callable | None = None,*,quiet: bool = False):
         if self.worker is not None:
             messagebox.showinfo('Task already running','Stop the current operation before starting another.',parent=self.root)
             return
         self.control = Control()
         self.success_callback = success
         self.task_title = title
+        self.task_quiet = quiet
         self.status.set(title)
         for widget in self.action_widgets:
             widget.state(['disabled'])
@@ -779,8 +907,39 @@ class App:
                 self.status.set(value)
             elif kind == 'stats':
                 self.update_stats(value)
+            elif kind == 'pipeline':
+                stage = value.get('stage')
+                if stage == 'scan':
+                    self.pipeline_started = 0.0
+                    self.pipeline_progress.stop()
+                    self.pipeline_progress.configure(mode='indeterminate')
+                    self.pipeline_progress.start(15)
+                    self.pipeline_status.set('Overall progress: discovering creators and paging new content…')
+                    self.overall_status.set('Files: waiting for discovery to finish')
+                elif stage == 'download':
+                    self.pipeline_started = time.monotonic()
+                    self.pipeline_total = int(value.get('total',0))
+                    self.pipeline_progress.stop()
+                    self.pipeline_progress.configure(mode='determinate',value=0)
+                    self.pipeline_status.set(f'Overall progress: download queue ready · 0/{self.pipeline_total} files · ETA estimating…')
+                elif stage == 'done':
+                    self.pipeline_progress.stop()
+                    self.pipeline_progress.configure(mode='determinate',value=100)
+                    self.pipeline_status.set('Overall progress: finished')
             elif kind == 'overall':
-                self.overall_progress.configure(value=100*value['done']/max(1,value['total']))
+                total = max(1,value['total'])
+                done = value['done']
+                self.overall_progress.configure(value=100*done/total)
+                self.overall_status.set(f"Files: {done}/{value['total']} complete")
+                if self.pipeline_started:
+                    elapsed = time.monotonic()-self.pipeline_started
+                    if done > 0 and elapsed > 0:
+                        eta = f' · ETA {format_duration((value["total"]-done)*(elapsed/done))}'
+                    else:
+                        eta = ' · ETA estimating…'
+                    self.pipeline_progress.stop()
+                    self.pipeline_progress.configure(mode='determinate',value=100*done/total)
+                    self.pipeline_status.set(f'Overall progress: {100*done//total}% · {done}/{value["total"]} files{eta}')
             elif kind == 'progress':
                 self.file_progress.configure(value=100*value['done']/value['total'] if value['total'] else 0)
                 total = readable_bytes(value['total']) if value['total'] else 'unknown size'
@@ -800,18 +959,21 @@ class App:
                     self.session_status.set('Session test failed · not ready; see the safe diagnostic in Activity')
                 self.status.set('Operation failed · check the activity log')
                 self.log(value)
-                if not self.closing:
+                if not self.closing and not self.task_quiet:
                     messagebox.showerror('Operation failed',value,parent=self.root)
             elif kind == 'done':
                 self.worker = None
                 self.success_callback = None
                 self.task_title = ''
+                self.task_quiet = False
                 for widget in self.action_widgets:
                     widget.state(['!disabled'])
                 self._sync_download_controls()
                 self.stop_button.state(['disabled'])
                 self.pause_button.state(['disabled'])
                 self.pause_button.configure(text='Pause')
+                if self.task_title == '' and self._auto_check_id is None:
+                    self._reschedule_auto_check()
                 if self.closing:
                     self.root.destroy()
                     return
@@ -858,6 +1020,12 @@ class App:
             self.stop_button.state(['disabled'])
 
     def close(self):
+        if self._auto_check_id is not None:
+            try:
+                self.root.after_cancel(self._auto_check_id)
+            except tk.TclError:
+                pass
+            self._auto_check_id = None
         if self.worker:
             self.closing = True
             self.stop()
@@ -907,7 +1075,72 @@ class App:
         except OSError:
             messagebox.showerror('Open folder','The operating system could not open this folder.',parent=self.root)
 
+    def _preference_values(self) -> dict[str,Any]:
+        values = {'output_dir':self.output_dir.get(),'rules_source':self.rules_source.get(),
+                  'skip_profiles':self.skip_profiles.get(),'profiles':self.profiles_text.get('1.0','end-1c'),
+                  'browser_channel':self.browser_channel.get(),
+                  'creator_mode':self.creator_mode.get(), 'date_mode':self.date_mode.get(),
+                  'days':self.days.get(), 'since':self.since.get(),
+                  'theme':self.theme_mode.get(), 'autoload_session':self.autoload_session.get(),
+                  'auto_check':self.auto_check.get(), 'auto_check_interval':self.auto_check_interval.get()}
+        values.update({name:var.get() for name,var in self.flags.items()})
+        return values
+
+    def _persist_silently(self):
+        if self._loading:
+            return
+        try:
+            save_preferences(self._preference_values(),self.preferences_path)
+        except OSError:
+            pass
+
+    def _auto_check_changed(self, *args):
+        if self._loading:
+            return
+        self._reschedule_auto_check()
+        self._persist_silently()
+
+    def _reschedule_auto_check(self):
+        if self._auto_check_id is not None:
+            try:
+                self.root.after_cancel(self._auto_check_id)
+            except tk.TclError:
+                pass
+            self._auto_check_id = None
+        if self._loading or self.closing or not self.auto_check.get():
+            return
+        try:
+            minutes = int(str(self.auto_check_interval.get()).strip())
+        except (TypeError,ValueError):
+            return
+        if minutes < 1:
+            return
+        minutes = min(minutes,10080)
+        self._auto_check_id = self.root.after(minutes*60_000,self._auto_check_fire)
+
+    def _auto_check_fire(self):
+        self._auto_check_id = None
+        if self.closing or not self.auto_check.get():
+            return
+        if self.worker is not None:
+            self._reschedule_auto_check()
+            return
+        self.log('Automatic check for new content started.')
+        self.start_download(False,auto=True)
+
+    def _autoload_session(self):
+        if self.worker is not None or self.closing:
+            return
+        self.run_task('Loading saved session',lambda control,emit:load_session(),self.apply_credentials,quiet=True)
+
     def _load_preferences(self):
+        self._loading = True
+        try:
+            self._load_preferences_inner()
+        finally:
+            self._loading = False
+
+    def _load_preferences_inner(self):
         try:
             values = load_preferences(self.preferences_path)
         except ValueError as exc:
@@ -944,18 +1177,18 @@ class App:
         for name,var in self.flags.items():
             if isinstance(values.get(name),bool):
                 var.set(values[name])
+        self.theme_mode.set('dark' if values.get('theme') == 'dark' else 'light')
+        self.autoload_session.set(bool(values.get('autoload_session', False)))
+        self.auto_check.set(bool(values.get('auto_check', False)))
+        interval = str(values.get('auto_check_interval', '30')).strip()
+        self.auto_check_interval.set(interval if interval else '30')
+        self._apply_theme()
         self._sync_download_controls()
         self._update_creator_summary()
 
     def save_settings(self):
-        values = {'output_dir':self.output_dir.get(),'rules_source':self.rules_source.get(),
-                  'skip_profiles':self.skip_profiles.get(),'profiles':self.profiles_text.get('1.0','end-1c'),
-                  'browser_channel':self.browser_channel.get(),
-                  'creator_mode':self.creator_mode.get(), 'date_mode':self.date_mode.get(),
-                  'days':self.days.get(), 'since':self.since.get()}
-        values.update({name:var.get() for name,var in self.flags.items()})
         try:
-            save_preferences(values,self.preferences_path)
+            save_preferences(self._preference_values(),self.preferences_path)
             self.log('Nonsecret preferences saved; no session credentials were included.')
             self.status.set('Preferences saved')
         except OSError:

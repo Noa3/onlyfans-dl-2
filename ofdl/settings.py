@@ -10,7 +10,8 @@ from typing import Any
 DEFAULT_RULES_SOURCE = 'https://raw.githubusercontent.com/DATAHOARDERS/dynamic-rules/main/onlyfans.json'
 PREFERENCE_KEYS = {'output_dir','profiles','skip_profiles','days','since','albums','subfolders',
                    'photos','videos','audio','posts','stories','messages','archived','purchased',
-                   'previews','rules_source','browser_channel','creator_mode','date_mode'}
+                   'previews','rules_source','browser_channel','creator_mode','date_mode',
+                   'theme','autoload_session','auto_check','auto_check_interval'}
 
 
 def config_dir() -> Path:

@@ -1,5 +1,35 @@
 # Changes from the supplied onlyfans-dl.py
 
+## Desktop 2.1.0 — 2026-10-07 — dark mode, session autoload, scheduled checks, overall ETA
+
+### Interface
+
+- Add a header **Dark mode / Light mode** toggle that recolors the whole app immediately
+  (ttk theme, window, tab, entry, list, scrollbar and progress colors) and is remembered
+  in preferences.
+- Remove the old "A local interface for your own account…" header subtitle.
+- Add a **Load the saved session automatically when the app starts** checkbox on the
+  Session tab. It reads the OS credential store on launch, quietly logs instead of
+  prompting when nothing is saved, and never writes a plaintext session.
+- Add **Check for new content automatically** on the Downloads tab, every 1–10080 minutes.
+  The timer runs only while the window stays open (never as an OS autostart) and skips
+  silently, without a dialog, when the session or options are not ready.
+- Activity: the log is compacted (smaller fixed font, narrower column) so the **Latest
+  media** preview area expands. The preview frame is now elastic and the **Open file**
+  button is pinned to the bottom, so it stays visible at any window height.
+- Add a third, **overall** progress bar with an estimated time to finish. It animates
+  during creator discovery/paging, then shows queue percentage and ETA during transfer,
+  alongside the existing per-run and per-file bars.
+
+### Notes
+
+- Theme, autoload and automatic-check values are nonsecret preferences; session values
+  remain excluded from preferences exactly as before.
+- 168 local tests pass (163 retained plus new theme, autoload, auto-check, pipeline/ETA
+  and header-subtitle checks). See TEST_REPORT.md.
+
+---
+
 ## Desktop 2.0.3 — 2026-10-06 — Activity preview and large-library legacy adoption
 
 ### Activity preview
