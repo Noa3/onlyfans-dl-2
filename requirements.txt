@@ -2,3 +2,6 @@
 requests>=2.32.5,<3
 keyring>=25.6,<26
 Pillow>=11.0,<13
+# Browser-like TLS transport: avoids Cloudflare 403 HTML pages on some networks.
+# The client falls back to plain requests automatically if this cannot be installed.
+curl_cffi>=0.7,<2

@@ -1,4 +1,4 @@
-# OnlyFans DL — Desktop 2.1.0
+# OnlyFans DL — Desktop 2.1.1
 
 This tool downloads all photos/videos from OnlyFans profiles, creating a local archive.
 You must be subscribed to the profile to download their content.
@@ -13,6 +13,18 @@ challenges.
 
 **Extract the entire folder.** Keep `onlyfans-dl.py`, the `ofdl/` package, and the
 other files together. The launcher is not a standalone replacement file.
+
+## What's new in 2.1.1
+
+- **Cloudflare-compatible API transport.** Some networks answer the account API with a
+  `403` HTML protection page even when the session is valid. API requests now carry the
+  same optional browser headers a normal XHR sends, and when the optional `curl_cffi`
+  package is installed they use a Chrome TLS impersonation profile. This is a
+  compatibility transport, not a challenge solver — a real JavaScript/managed challenge
+  is still never bypassed. The client falls back to plain `requests` if `curl_cffi` is
+  missing. Rule downloads still use plain `requests`.
+- Clearer guidance in the `403` HTML message: the session is often tied to the network
+  it was created on, so capture and use it from the same connection.
 
 ## What's new in 2.1.0
 
@@ -236,8 +248,10 @@ old rules are silently bundled as a fallback, and a schema-valid file is **not**
 platform currently accepts it.
 
 401 usually means a fresh session. For 403, verify access, current session/rules, and
-system clock. 429 and transient errors retry with backoff and respect reasonable
-Retry-After values. A scan that failed for some categories is reported as **finished with
+system clock; a `403` that returns HTML is a Cloudflare protection page rather than an
+API answer, so also use the same network the session was captured on and let the
+browser-like transport run. 429 and transient errors retry with backoff and respect
+reasonable Retry-After values. A scan that failed for some categories is reported as **finished with
 issues**, not a complete backup. TLS verification stays enabled; API/rules redirects are
 refused; media redirects are revalidated.
 

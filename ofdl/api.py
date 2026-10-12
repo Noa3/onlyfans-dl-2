@@ -22,6 +22,7 @@ from .auth import Credentials
 from .common import AppError, Control, EventSink, no_events
 from .settings import atomic_json, config_dir
 from .diagnostics import ErrorDetails, clock_hint, details_from_json, inspect_error_response
+from .http import BROWSER_HEADERS, NETWORK_ERRORS, Transport
 
 API_ORIGIN = 'https://onlyfans.com'
 API_URL = API_ORIGIN + '/api2/v2'
@@ -48,7 +49,10 @@ class ApiError(AppError):
             elif details.category == 'refresh-required':
                 advice = 'The server requested a refresh without identifying the cause. Refresh rules once and retest; this message does not prove your credentials are wrong.'
             elif details.response_type == 'html':
-                advice = 'An HTML page was returned instead of API JSON. A login/protection page or service error may be responsible. Use a normal browser; challenges are not bypassed.'
+                advice = ('An HTML page (usually a Cloudflare protection page) was returned instead of API JSON. '
+                          'The session is often tied to the network it was created from, so capture and use it from the '
+                          'same connection, or try a fresh session from a different browser. A challenged network/IP or '
+                          'a security challenge can still block this client, and challenges are never bypassed.')
             elif details.category == 'authentication-rejected':
                 advice = 'The server reported an authentication rejection. Import a fresh session from your normal logged-in browser.'
         prefix = 'API returned an error object (HTTP 200)' if status == 200 else f'HTTP {status}'
@@ -244,17 +248,19 @@ class ApiClient:
         self.auth = auth.validate()
         self.rules = rules
         self.control = control
-        self.session = session or requests.Session()
-        self.session.trust_env = False
+        self.transport = Transport(session)
+        self.session = self.transport.session
         self.interval = max(0.0, interval)
         self.retries = max(0, min(5, retries))
         self.emit = emit
         self.last_request = 0.0
+        self.emit('log', 'API transport: ' + self.transport.kind +
+                  (' (browser TLS impersonation for Cloudflare compatibility)' if self.transport.using_curl else ' (plain HTTP client)'))
         if 'user-id' in self.rules.remove_headers:
             self.emit('log', 'Rules requested removal of user-id; retained because this client signs with the authenticated user-id. No account values are logged.')
 
     def close(self) -> None:
-        self.session.close()
+        self.transport.close()
 
     def __enter__(self) -> ApiClient:
         return self
@@ -279,11 +285,13 @@ class ApiClient:
         for attempt in range(self.retries + 1):
             self.control.checkpoint()
             self.control.wait(max(0.0, self.last_request + self.interval - time.monotonic()))
-            headers = {'Accept':'application/json, text/plain, */*','User-Agent':self.auth.user_agent,
-                       'x-bc':self.auth.x_bc,'user-id':self.auth.user_id,'Cookie':self.auth.cookie_header(),
-                       'app-token':self.rules.app_token,'Referer':API_ORIGIN + '/', 'Accept-Encoding':'gzip, deflate'}
-            prepared = self.session.prepare_request(requests.Request('GET', API_URL + endpoint,
-                                                                       params=params, headers=headers))
+            headers = dict(BROWSER_HEADERS)
+            headers.update({'User-Agent':self.auth.user_agent,'x-bc':self.auth.x_bc,
+                            'user-id':self.auth.user_id,'Cookie':self.auth.cookie_header(),
+                            'app-token':self.rules.app_token,'Referer':API_ORIGIN + '/'})
+            # Build locally: works for both the requests and curl_cffi transports and
+            # keeps the exact signed path/query independent of the backend.
+            prepared = requests.Request('GET', API_URL + endpoint, params=params, headers=headers).prepare()
             # Keep the identity used by this authenticated client's signing contract.
             # Some providers publish removal metadata intended for other clients.
             # Apply optional removals first; never sign with an ID then delete it.
@@ -294,26 +302,37 @@ class ApiClient:
             prepared.headers['sign'] = self.rules.signature(prepared.path_url, stamp, prepared.headers['user-id'])
             prepared.headers['time'] = stamp
             self.last_request = time.monotonic()
+            response = None
+            header = None
             try:
-                with self.session.send(prepared, timeout=TIMEOUT, verify=True, allow_redirects=False, stream=True) as response:
-                    status = response.status_code
-                    if status == 429 or 500 <= status <= 599:
-                        if attempt >= self.retries:
-                            raise self._api_error(response, prepared)
-                        header = response.headers.get('Retry-After')
-                    elif status != 200:
+                response = self.transport.send(prepared, timeout=TIMEOUT, verify=True,
+                                               allow_redirects=False, stream=True)
+                status = response.status_code
+                if status == 429 or 500 <= status <= 599:
+                    if attempt >= self.retries:
                         raise self._api_error(response, prepared)
-                    else:
-                        data = _read_json(response, MAX_API_BYTES, self.control)
-                        if isinstance(data,dict) and data.get('error'):
-                            raise self._api_error(response, prepared, details_from_json(data))
-                        return data
+                    header = response.headers.get('Retry-After')
+                elif status != 200:
+                    raise self._api_error(response, prepared)
+                else:
+                    data = _read_json(response, MAX_API_BYTES, self.control)
+                    if isinstance(data,dict) and data.get('error'):
+                        raise self._api_error(response, prepared, details_from_json(data))
+                    return data
             except requests.exceptions.SSLError:
                 raise AppError('TLS certificate verification failed. Check your clock and certificate setup; verification is still enabled.') from None
-            except requests.RequestException:
+            except NETWORK_ERRORS as exc:
+                if 'ssl' in str(exc).lower() or 'certificate' in str(exc).lower():
+                    raise AppError('TLS certificate verification failed. Check your clock and certificate setup; verification is still enabled.') from None
                 if attempt >= self.retries:
                     raise AppError('The API connection failed or timed out after its retry limit.') from None
                 header = None
+            finally:
+                if response is not None:
+                    try:
+                        response.close()
+                    except Exception:
+                        pass
             wait_retry(self.control, attempt, header, self.emit)
         raise AppError('The API request could not be completed.')
 

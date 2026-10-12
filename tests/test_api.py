@@ -93,6 +93,34 @@ class ApiTests(unittest.TestCase):
         parsed = Rules.from_dict(rules)
         self.assertEqual(parsed.remove_headers, ('user_id', 'x_optional'))
 
+    def test_requests_are_sent_with_browser_like_headers(self):
+        client, adapter = self.client([(200, {'id':123}, {})])
+        client.request('/users/me')
+        headers = adapter.requests[0].headers
+        self.assertEqual(headers.get('Accept-Language'), 'en-US,en;q=0.9')
+        self.assertEqual(headers.get('sec-fetch-site'), 'same-origin')
+        self.assertEqual(headers.get('sec-fetch-mode'), 'cors')
+        self.assertEqual(headers.get('user-id'), AUTH.user_id)
+
+    def test_injected_session_keeps_the_plain_requests_transport(self):
+        client, _ = self.client([(200, {'id':123}, {})])
+        self.assertEqual(client.transport.kind, 'requests')
+
+    def test_transport_prefers_impersonation_only_without_an_injected_session(self):
+        from ofdl.http import HAVE_CURL_CFFI, Transport
+        self.assertEqual(Transport(requests.Session()).kind, 'requests')
+        self.assertEqual(Transport(None, prefer_impersonate=False).kind, 'requests')
+        if HAVE_CURL_CFFI:
+            self.assertEqual(Transport(None).kind, 'curl_cffi')
+
+    def test_browser_headers_respect_rule_removals_without_touching_identity(self):
+        client, adapter = self.client([(200, {}, {})], dict(RULE_DATA, remove_headers=['Accept-Language']))
+        client.request('/users/me')
+        headers = adapter.requests[0].headers
+        self.assertNotIn('Accept-Language', headers)
+        self.assertEqual(headers.get('user-id'), AUTH.user_id)
+        self.assertIn('sign', headers)
+
     def test_optional_headers_can_be_removed_without_changing_signed_identity(self):
         client, adapter = self.client([(200,{}, {})], dict(RULE_DATA, remove_headers=['Accept-Encoding']))
         client.request('/users/me')

@@ -40,3 +40,6 @@ cookies.txt
 .ofdl*
 .ofdl.sqlite3
 .ofdl.lock
+
+# --- CodeGraph index ---
+.codegraph/

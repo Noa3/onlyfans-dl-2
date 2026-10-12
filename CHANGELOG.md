@@ -1,5 +1,33 @@
 # Changes from the supplied onlyfans-dl.py
 
+## Desktop 2.1.1 — 2026-10-12 — Cloudflare-compatible API transport
+
+### Reported issue
+
+A user reported `HTTP 403 ... An HTML page was returned instead of API JSON`. That page
+is Cloudflare refusing the request before the API is reached, not a wrong session. The
+current client was verified live against a real account and returned HTTP 200 JSON on an
+unchallenged network, so the failure is network/session specific rather than a broken sign.
+
+### Changes
+
+- Send API requests with the same optional headers a real same-origin XHR sends
+  (`Accept-Language`, `sec-fetch-dest/mode/site`, `priority`) alongside the existing
+  authentication and signing headers. Rules may still remove individual optional headers.
+- When the optional `curl_cffi` package is installed, API calls use a Chrome TLS
+  impersonation profile so the handshake looks like a browser's instead of OpenSSL's.
+  This addresses the passive Cloudflare fingerprint that produces the 403 HTML page.
+  The client falls back to plain `requests` automatically when `curl_cffi` is absent or
+  when a caller injects its own session.
+- The public signing-rules download deliberately keeps using plain `requests`.
+- A genuine JavaScript/managed Cloudflare challenge is still never bypassed; the new
+  transport only makes the request look like a normal browser request.
+- Clearer 403-HTML advice: the session is often tied to the network it was created on.
+- `curl_cffi` added to `requirements.txt`; `ofdl/http.py` holds the transport.
+- 172 local tests pass (168 retained plus browser-header and transport-selection tests).
+
+---
+
 ## Desktop 2.1.0 — 2026-10-07 — dark mode, session autoload, scheduled checks, overall ETA
 
 ### Interface
