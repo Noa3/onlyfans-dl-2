@@ -1,4 +1,4 @@
-# OnlyFans DL — Desktop 2.1.1
+# OnlyFans DL — Desktop 2.5.0
 
 <img width="706" height="597" alt="grafik" src="https://github.com/user-attachments/assets/c5273233-e35f-4e3e-864f-98f5b79bc7e3" /><img width="703" height="595" alt="grafik" src="https://github.com/user-attachments/assets/6e27fac5-858b-46a5-8734-364618beb937" />
 
@@ -16,6 +16,76 @@ challenges.
 
 **Extract the entire folder.** Keep `onlyfans-dl.py`, the `ofdl/` package, and the
 other files together. The launcher is not a standalone replacement file.
+
+## What's new in 2.5.0
+
+- **Broader free/trial scan.** The tab now also reads your **inbox chat partners**,
+  your **custom lists** and the **website promotion banners** shown to your account, in
+  addition to active/expired subscriptions, chat messages and names you type in.
+  Creators who wrote to you or are in your lists are covered even without a
+  subscription. Banners that contain a trial link become claimable rows; paid banners
+  are skipped.
+- **Visible scan progress.** An inline progress bar and a status line name the current
+  phase (subscriptions, inbox, lists, promotions, chat messages, entered names) with
+  done/total counters, and report start, stop, failure and finish.
+- **No paid actions.** The tool never opens a paid subscription and never buys paid
+  content. Only zero-price pages and shared free-trial codes can be acted on, after
+  confirmation. Existing paid subscriptions and already purchased content keep
+  downloading normally, including the Purchased category.
+- Still no platform-wide scan: there is no endpoint that lists every creator, so
+  coverage is limited to creators connected to your account.
+- 220 local tests pass.
+
+## What's new in 2.4.0
+
+- **Explicit proxy / VPN support.** A proxy field on the Session tab (and `--proxy` for
+  the CLI) accepts `http://`, `https://`, `socks5://` and `socks5h://`. It is applied to
+  the account API, the public rules download, the media downloads and the browser
+  helper, because signed CDN URLs are tied to the requesting IP. Proxying only the API
+  while media goes direct is the usual cause of media 403s.
+- Ambient `*_PROXY` variables and `.netrc` stay ignored; only the explicit value is
+  used. A proxy URL with username/password stays in memory and is never written to
+  `settings.json`. SOCKS support comes from PySocks in `requirements.txt`.
+- Help text now covers VPN pitfalls: Cloudflare 403 HTML on VPN ranges, rotating exit
+  IPs breaking signed URLs, per-IP 429 limits, and split tunnels.
+- **DRM items are counted separately** in the activity stats and CLI summary
+  (`DRM-protected (skipped)`) instead of being folded into unavailable media. DRM is
+  still never bypassed or decrypted.
+- 214 local tests pass (208 retained plus proxy validation, proxy propagation,
+  credential-safe persistence and DRM counting).
+
+## What's new in 2.3.0
+
+- **Duplicates tab.** Compares media files inside one library folder by SHA-256 and
+  groups identical content, even when it sits under a different creator folder or an
+  old layout. Only equal-size files are hashed, and hashes are cached per path, size and
+  modification time in `file_hashes.sqlite3`.
+- Each group marks one keeper: the copy the download manifest already knows, otherwise
+  the shortest path. Select any file row and use **Use selected copy as keeper** to
+  change it.
+- **Delete other copies** removes only the non-kept files inside the chosen folder,
+  after confirmation. Every extra copy is re-hashed right before deletion, so changed
+  files are skipped; symbolic links are never followed. Deletion bypasses the recycle
+  bin and cannot be undone.
+- Symbolic links, hidden files, `.part` files and non-media files are ignored. The
+  report is local only and uploads nothing.
+
+## What's new in 2.2.0
+
+- **Free & trials tab.** A new tab scans your active and expired subscriptions, the
+  newest messages of those chats, and an optional creator list for offers that cost
+  nothing. A page is free when its regular price is 0; a free trial is a 0 current
+  price or a claimable 0 promotion on a paid page. Paid offers are never listed or
+  acted on.
+- **Sort and filter.** Filter by Free only / Trials only and Available / Already
+  subscribed; click any column heading to sort.
+- **Confirm-before-action subscribe.** Select rows and confirm; free pages use the
+  account's own subscribe endpoint and shared trial links are claimed by their code.
+  Rows for pages you already subscribe to are read-only and cannot be subscribed
+  twice. Claimed codes are remembered (hashed, never plaintext) in
+  `free_trials.json`, so a link is not claimed again.
+- Trial offers without a code stay informational and open the website instead.
+  Unsubscribing, renewals and paid promotion claims remain manual.
 
 ## What's new in 2.1.1
 

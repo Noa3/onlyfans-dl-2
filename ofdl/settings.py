@@ -11,7 +11,10 @@ DEFAULT_RULES_SOURCE = 'https://raw.githubusercontent.com/DATAHOARDERS/dynamic-r
 PREFERENCE_KEYS = {'output_dir','profiles','skip_profiles','days','since','albums','subfolders',
                    'photos','videos','audio','posts','stories','messages','archived','purchased',
                    'previews','rules_source','browser_channel','creator_mode','date_mode',
-                   'theme','autoload_session','auto_check','auto_check_interval'}
+                   'theme','autoload_session','auto_check','auto_check_interval',
+                   'scan_active','scan_expired','scan_messages','offer_names','offer_filter',
+                   'offer_status_filter','duplicate_dir','proxy','scan_inbox','scan_lists',
+                   'scan_promotions'}
 
 
 def config_dir() -> Path:

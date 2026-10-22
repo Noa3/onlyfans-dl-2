@@ -5,6 +5,7 @@ from typing import Any
 from urllib.parse import urlsplit
 from .auth import Credentials, SessionError, is_api_url
 from .common import AppError, Cancelled, Control, EventSink, no_events
+from .http import playwright_proxy
 
 
 def credentials_from_response(response: Any) -> Credentials | None:
@@ -97,7 +98,8 @@ def capture_context(context: Any, control: Control, *, timeout: float = 300,
 
 
 def capture_session(control: Control, *, channel: str = 'chromium',
-                    emit: EventSink = no_events) -> Credentials:
+                    emit: EventSink = no_events, proxy: str = '') -> Credentials:
+    proxy_options = playwright_proxy(proxy)
     try:
         from playwright.sync_api import sync_playwright, Error as PlaywrightError
     except ImportError:
@@ -111,6 +113,8 @@ def capture_session(control: Control, *, channel: str = 'chromium',
                 kwargs = {'headless':False,'timeout':30000}
                 if channel != 'chromium':
                     kwargs['channel'] = channel
+                if proxy_options:
+                    kwargs['proxy'] = proxy_options
                 browser = playwright.chromium.launch(**kwargs)
             except PlaywrightError as exc:
                 raise _browser_failure(exc, launch=True) from None

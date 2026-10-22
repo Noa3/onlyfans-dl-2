@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 from . import __version__
 from .api import ApiClient, load_rules
@@ -22,6 +23,9 @@ from .auth import (Credentials, SessionError, forget_session, load_session, pars
 from .browser import capture_session
 from .common import AppError, Cancelled, Control
 from .downloads import CATEGORIES, Options, parse_profiles, run_downloads
+from .duplicates import DuplicateGroup, delete_extras, find_duplicates
+from .offers import (AVAILABLE, FREE, Offer, OfferHistory, claim_offer, scan_offers,
+                     SUBSCRIBED, TRIAL)
 from .preview import PreviewResult, build_preview
 from .settings import DEFAULT_RULES_SOURCE, config_dir, load_preferences, save_preferences
 
@@ -54,6 +58,14 @@ By default the session remains in this running app's memory and is discarded on 
 
 Preferences and rules cache are nonsecret, but profile names, output paths, local filenames, and the media manifest are still private metadata. Protect your device and backups. Other software running as your OS user may be able to access the keychain. The application has no telemetry or hosted authentication service.
 
+NETWORK · VPN AND PROXY
+
+A proxy is optional and explicit. Enter scheme://host:port on the Session tab (http, https, socks5, socks5h; socks5h resolves DNS through the proxy). It is used for the account API, the public signing-rules download, the media downloads and the browser helper, because OnlyFans CDN URLs are signed for the IP that requested them. Routing only the API through a proxy/VPN while media goes direct usually ends in 403 media downloads.
+
+Ambient HTTP_PROXY/HTTPS_PROXY/ALL_PROXY variables and .netrc are still ignored; only the field or --proxy is used. A proxy URL containing username:password stays in memory and is not written to settings.json. SOCKS support needs the PySocks package, which requirements.txt installs.
+
+VPN tips: capture the session and run the app from the same exit IP/location. Many VPN ranges are answered with a Cloudflare HTML 403; that challenge is not bypassed. Rotating exit IPs can break signed media URLs mid-run, so prefer a stable exit or a fixed proxy. Rate limits (429) apply per IP and are not worked around. A split tunnel that sends only some traffic through the VPN is the usual cause of mixed API success and media 403s.
+
 SIGNING RULES AND ACCESS
 
 This is an unofficial client based on the supplied script. Signing rules and endpoint behavior can change. Refresh rules after a signature-related rejection, check the system clock, and re-import a current session. A schema-valid rules file is not proof that the platform still accepts it. The default source is community-maintained; you may choose a different trusted HTTPS JSON URL or a local file. Its server sees an ordinary connection/IP address, but not your account session.
@@ -81,6 +93,54 @@ Only these creators is optional. Choose it to enable the creator text box and en
 Earlier saved creator lists stay in Only these creators mode rather than being silently expanded. To switch to everyone, choose All active subscriptions and Save preferences. Disabled creator/date fields retain their values but do not affect the run. Days is enabled only for Last N days; Date is enabled only for Since date. All dates disables both.
 
 Date filters use UTC and apply locally to posts, messages, purchases and stories. Undated media is excluded when a date filter is set. All dates + existing-file skipping is the safest repeat-run mode: it also finds newly added media on older posts. The old filename-derived “latest date” shortcut was deliberately removed because it can miss such files.
+
+FREE & TRIALS
+
+The Free & trials tab lists only offers that cost nothing. A page counts as free when
+its regular price is 0. A free trial is a 0 current price or a claimable 0 promotion on a
+paid page. Nothing above 0 is ever shown or acted on, so this tab cannot start a paid
+purchase and there is no purchase automation.
+
+Scan sources: active subscriptions (also shows free/trial pages you already have),
+expired subscriptions, the newest messages of those chats (shared trial links), your
+inbox chat partners, your own custom lists, the promotion banners the website shows to
+your account, and an optional creator list you type in. There is no endpoint that
+enumerates every creator on the platform, so a platform-wide scan is not offered; inbox,
+lists and banners only cover creators who contacted you, are in your lists, or are
+advertised to your account. Chat scanning reads only the newest pages per chat, caps the
+number of chats, and skips a chat it cannot read. The inline progress bar and status
+line show which source is being read.
+
+Already-subscribed rows are labelled and cannot be subscribed again. Claimed trial codes
+are remembered in free_trials.json with a hash only, so the same link is not claimed
+twice even after a restart. Free-page and trial actions are sent only after you select
+rows and confirm the dialog. Subscriptions happen on your real account: check renewal
+settings on the website afterwards.
+
+Paid promotions, paid offers and paid content purchases are never listed, claimed or
+started here. The tool does not buy anything and does not open a new paid subscription.
+Content you already paid for or already subscribe to stays downloadable through the
+normal Downloads tab (including the Purchased category); nothing about that changed.
+
+Free subscription uses the account's own subscribe endpoint; a shared trial link is
+claimed by its code. A trial offer with no code is informational and must be claimed on
+the website. Unsubscribing, paid renewals, and paid promotion claims are not automated.
+
+DUPLICATES
+
+The Duplicates tab compares the contents of media files inside one library folder by
+SHA-256, so the same bytes stored under two names or two folder layouts are reported
+together. Only files with an identical size are hashed; hashes are cached per path,
+size and modification time. Symbolic links are ignored and non-media files are not read.
+
+Each group keeps one copy: the copy recorded in the download manifest when possible,
+otherwise the shortest path. Select a file row and use Use selected copy as keeper to
+change that. Delete other copies removes only the non-kept files, inside the chosen
+folder, after you confirm. Every extra copy is re-hashed immediately before deletion, so
+a file that changed meanwhile is skipped. Deletion bypasses the recycle bin.
+
+This report is local only. It does not change the download manifest and does not upload
+filenames or hashes anywhere.
 
 TROUBLESHOOTING
 
@@ -160,6 +220,7 @@ class App:
         self.preview_requests: queue.Queue[Any] = queue.Queue(maxsize=1)
         self.output_dir = tk.StringVar(root,str(Path.home()/'Downloads'/'OnlyFans'))
         self.rules_source = tk.StringVar(root,DEFAULT_RULES_SOURCE)
+        self.proxy = tk.StringVar(root,'')
         self.browser_channel = tk.StringVar(root,'Chromium')
         self.creator_mode = tk.StringVar(root, 'all')
         self.creator_summary = tk.StringVar(root, '')
@@ -175,6 +236,27 @@ class App:
         self.auto_check_interval = tk.StringVar(root,'30')
         self.pipeline_status = tk.StringVar(root,'Overall progress: idle')
         self.overall_status = tk.StringVar(root,'Files: idle')
+        self.scan_active = tk.BooleanVar(root,True)
+        self.scan_expired = tk.BooleanVar(root,True)
+        self.scan_messages = tk.BooleanVar(root,True)
+        self.scan_inbox = tk.BooleanVar(root,True)
+        self.scan_lists = tk.BooleanVar(root,True)
+        self.scan_promotions = tk.BooleanVar(root,True)
+        self._offer_scanning = False
+        self.offer_names = tk.StringVar(root,'')
+        self.offer_filter = tk.StringVar(root,'All offers')
+        self.offer_status_filter = tk.StringVar(root,'All statuses')
+        self.offer_status = tk.StringVar(root,'No scan yet. Choose sources and click Scan now.')
+        self.offer_summary = tk.StringVar(root,'')
+        self.offers: dict[str,Offer] = {}
+        self.offer_sort = ('creator', False)
+        self._offer_refreshing = False
+        self.duplicate_dir = tk.StringVar(root,str(Path.home()/'Downloads'/'OnlyFans'))
+        self.duplicate_status = tk.StringVar(root,'No duplicate scan yet.')
+        self.duplicate_summary = tk.StringVar(root,'')
+        self.duplicate_groups: list[DuplicateGroup] = []
+        self.duplicate_root: Path | None = None
+        self._dup_files: dict[str,Path] = {}
         self._loading = False
         self._auto_check_id: str | None = None
         self.pipeline_started = 0.0
@@ -189,9 +271,11 @@ class App:
         self.creator_mode.trace_add('write', self._update_creator_summary)
         self.skip_profiles.trace_add('write', self._update_creator_summary)
         self.date_mode.trace_add('write', self._sync_download_controls)
+        self.offer_filter.trace_add('write', self._refresh_offer_tree)
+        self.offer_status_filter.trace_add('write', self._refresh_offer_tree)
         self._sync_download_controls()
         self._update_creator_summary()
-        for var in [*self.auth_vars.values(), self.rules_source]:
+        for var in [*self.auth_vars.values(), self.rules_source, self.proxy]:
             var.trace_add('write', self._session_inputs_changed)
         self.auto_check.trace_add('write', self._auto_check_changed)
         self.auto_check_interval.trace_add('write', self._auto_check_changed)
@@ -257,6 +341,18 @@ class App:
             style.configure(f'{orient}.TScrollbar',background=p['button_bg'],troughcolor=p['window_bg'],
                             bordercolor=p['border'],arrowcolor=p['text'])
         style.configure('Horizontal.TProgressbar',background=p['accent'],troughcolor=p['progress_trough'],borderwidth=0)
+        style.configure('Treeview',background=p['field'],fieldbackground=p['field'],foreground=p['text'],
+                        bordercolor=p['border'],rowheight=26)
+        style.configure('Treeview.Heading',background=p['button_bg'],foreground=p['text'],relief='flat',padding=(8,6))
+        style.map('Treeview',background=[('selected',p['accent'])],foreground=[('selected','white')])
+        style.map('Treeview.Heading',background=[('active',p['button_active'])])
+        if hasattr(self,'offer_tree'):
+            self.offer_tree.tag_configure('subscribed',foreground=p['muted'])
+            self.offer_tree.tag_configure('used',foreground=p['muted'])
+            self.offer_tree.tag_configure('info',foreground=p['muted'])
+        if hasattr(self,'duplicate_tree'):
+            self.duplicate_tree.tag_configure('dup-extra',foreground=p['muted'])
+            self.duplicate_tree.tag_configure('dup-keep',foreground=p['accent'],font=('TkDefaultFont',10,'bold'))
         if hasattr(self,'header'):
             self.header.configure(bg=p['header_bg'])
             self.header_title.configure(bg=p['header_bg'],fg=p['header_text'])
@@ -300,9 +396,13 @@ class App:
         self.tabs.pack(fill='both',expand=True)
         self.session_tab = ttk.Frame(self.tabs)
         self.downloads_tab = ttk.Frame(self.tabs)
+        self.offers_tab = ttk.Frame(self.tabs,padding=20)
+        self.duplicates_tab = ttk.Frame(self.tabs,padding=20)
         self.activity_tab = ttk.Frame(self.tabs,padding=20)
         self.help_tab = ttk.Frame(self.tabs,padding=20)
-        for frame,label in ((self.session_tab,'1  Session'),(self.downloads_tab,'2  Downloads'),(self.activity_tab,'3  Activity'),(self.help_tab,'Help & privacy')):
+        for frame,label in ((self.session_tab,'1  Session'),(self.downloads_tab,'2  Downloads'),
+                            (self.offers_tab,'3  Free & trials'),(self.duplicates_tab,'4  Duplicates'),
+                            (self.activity_tab,'5  Activity'),(self.help_tab,'Help & privacy')):
             self.tabs.add(frame,text=label)
         self.session_content,self.session_canvas = self._scrollable_content(self.session_tab)
         self.downloads_content,self.downloads_canvas = self._scrollable_content(self.downloads_tab)
@@ -311,6 +411,8 @@ class App:
         self.root.bind('<Button-5>',self._scroll_wheel,add='+')
         self._session_tab()
         self._downloads_tab()
+        self._offers_tab()
+        self._duplicates_tab()
         self._activity_tab()
         self._help_tab()
         footer = ttk.Frame(self.root,padding=(24,8,24,10))
@@ -393,6 +495,17 @@ class App:
         ttk.Checkbutton(parent,text='Load the saved session automatically when the app starts',
                         variable=self.autoload_session,command=self._persist_silently).pack(anchor='w',pady=(10,0))
         ttk.Label(parent,textvariable=self.session_status,style='Muted.TLabel',wraplength=900).pack(anchor='w',pady=(10,12))
+        network = ttk.LabelFrame(parent,text='Network · optional proxy or VPN',padding=12)
+        network.pack(fill='x',pady=(0,12))
+        row = ttk.Frame(network)
+        row.pack(fill='x')
+        ttk.Label(row,text='Proxy URL',width=15).pack(side='left')
+        ttk.Entry(row,textvariable=self.proxy).pack(side='left',fill='x',expand=True)
+        ttk.Label(network,text='http://, https://, socks5:// or socks5h:// (socks5h resolves DNS through the proxy). '
+                               'Applied to the API, signing-rules download, media downloads and the browser helper. '
+                               'Signed media URLs are tied to the requesting IP, so use the same proxy for the whole app. '
+                               'A proxy with username:password is kept in memory and never written to settings.json.',
+                  style='Muted.TLabel',wraplength=900).pack(anchor='w',pady=(8,0))
         rules = ttk.LabelFrame(parent,text='Signing rules · independent of your login details',padding=12)
         rules.pack(fill='x')
         row = ttk.Frame(rules)
@@ -485,6 +598,438 @@ class App:
         row.pack(fill='x',pady=(12,0))
         self.button(row,'Save preferences',self.save_settings,side='left')
         ttk.Label(row,text='Saves only nonsecret settings—not your session.',style='Muted.TLabel').pack(side='left',padx=12)
+
+    def _offers_tab(self):
+        parent = self.offers_tab
+        ttk.Label(parent,text='Free subscriptions & free trials',style='Heading.TLabel').pack(anchor='w')
+        ttk.Label(parent,text='Only offers that cost nothing are listed. Paid prices are never shown or acted on, and nothing is subscribed until you confirm it.',
+                  style='Muted.TLabel',wraplength=900).pack(anchor='w',pady=(4,12))
+        sources = ttk.LabelFrame(parent,text='Scan sources',padding=12)
+        sources.pack(fill='x')
+        row = ttk.Frame(sources)
+        row.pack(fill='x')
+        ttk.Checkbutton(row,text='Active subscriptions',variable=self.scan_active).pack(side='left')
+        ttk.Checkbutton(row,text='Expired subscriptions',variable=self.scan_expired).pack(side='left',padx=(18,0))
+        ttk.Checkbutton(row,text='Newest chat messages (trial links)',variable=self.scan_messages).pack(side='left',padx=(18,0))
+        row = ttk.Frame(sources)
+        row.pack(fill='x',pady=(6,0))
+        ttk.Checkbutton(row,text='Inbox chat partners',variable=self.scan_inbox).pack(side='left')
+        ttk.Checkbutton(row,text='My custom lists',variable=self.scan_lists).pack(side='left',padx=(18,0))
+        ttk.Checkbutton(row,text='Website promo banners (0-price only)',variable=self.scan_promotions).pack(side='left',padx=(18,0))
+        ttk.Label(sources,text='Inbox, lists and website promos cover creators who contacted you, are in your lists, or are advertised to your account. There is no platform-wide creator list.',
+                  style='Muted.TLabel',wraplength=880).pack(anchor='w',pady=(6,0))
+        row = ttk.Frame(sources)
+        row.pack(fill='x',pady=(10,0))
+        ttk.Label(row,text='Also check creators').pack(side='left')
+        self.offer_names_entry = ttk.Entry(row,textvariable=self.offer_names)
+        self.offer_names_entry.pack(side='left',fill='x',expand=True,padx=(8,8))
+        self.button(row,'Scan now',self.scan_offers,accent=True,side='left')
+        ttk.Label(sources,text='Optional creator names or profile URLs, separated by commas. Active subscriptions are included so pages you already have appear read-only and cannot be subscribed twice.',
+                  style='Muted.TLabel',wraplength=880).pack(anchor='w',pady=(8,0))
+        ttk.Label(parent,textvariable=self.offer_status,style='Muted.TLabel',wraplength=900).pack(anchor='w',pady=(10,0))
+        self.offer_bar = ttk.Progressbar(parent,mode='indeterminate')
+        self.offer_bar.pack(fill='x',pady=(6,0))
+        filters = ttk.Frame(parent)
+        filters.pack(fill='x',pady=(10,0))
+        ttk.Label(filters,text='Show',style='Muted.TLabel').pack(side='left')
+        self.offer_filter_box = ttk.Combobox(filters,textvariable=self.offer_filter,state='readonly',width=13,
+                                            values=['All offers','Free only','Trials only'])
+        self.offer_filter_box.pack(side='left',padx=(8,14))
+        self.offer_state_box = ttk.Combobox(filters,textvariable=self.offer_status_filter,state='readonly',width=17,
+                                           values=['All statuses','Available only','Already subscribed'])
+        self.offer_state_box.pack(side='left')
+        self.offer_action_button = self.button(filters,'Subscribe selected',self.subscribe_selected,
+                                               accent=True,busy=True,side='right')
+        self.offer_action_button.state(['disabled'])
+        self.button(filters,'Open profile / link',self.open_offer_profile,busy=False,side='right',padx=(0,8))
+        table = ttk.Frame(parent)
+        table.pack(fill='both',expand=True,pady=(10,0))
+        columns = ('creator','kind','price','source','status','details')
+        self.offer_tree = ttk.Treeview(table,columns=columns,show='headings',selectmode='extended',height=12)
+        for column,label,width,anchor in (('creator','Creator',170,'w'),('kind','Type',90,'w'),
+                                          ('price','Price',70,'w'),('source','Found via',180,'w'),
+                                          ('status','Status',120,'w'),('details','Details',330,'w')):
+            self.offer_tree.heading(column,text=label,command=lambda name=column:self._sort_offers_by(name))
+            self.offer_tree.column(column,width=width,anchor=anchor,
+                                   stretch=column in {'creator','source','details'})
+        scrollbar = ttk.Scrollbar(table,orient='vertical',command=self.offer_tree.yview)
+        self.offer_tree.configure(yscrollcommand=scrollbar.set)
+        self.offer_tree.pack(side='left',fill='both',expand=True)
+        scrollbar.pack(side='right',fill='y')
+        self.offer_tree.bind('<<TreeviewSelect>>',self._offer_selection_changed)
+        bottom = ttk.Frame(parent)
+        bottom.pack(fill='x',pady=(8,0))
+        ttk.Label(bottom,textvariable=self.offer_summary,style='Muted.TLabel').pack(side='left')
+        ttk.Label(bottom,text='Actions are sent only for selected rows after confirmation. Check renewal settings on the website.',
+                  style='Muted.TLabel').pack(side='right')
+
+    def _offer_sort_key(self, offer: Offer, column: str):
+        return {'creator':offer.username.lower(),'kind':offer.label.lower(),'price':offer.price,
+                'source':offer.source.lower(),'status':offer.status,
+                'details':offer.detail.lower()}.get(column,'')
+
+    def _sort_offers_by(self, column: str):
+        if self.offer_sort[0] == column:
+            self.offer_sort = (column, not self.offer_sort[1])
+        else:
+            self.offer_sort = (column, False)
+        self._refresh_offer_tree()
+
+    def _refresh_offer_tree(self, *args):
+        if self._offer_refreshing or not hasattr(self,'offer_tree'):
+            return
+        self._offer_refreshing = True
+        try:
+            for item in self.offer_tree.get_children():
+                self.offer_tree.delete(item)
+            kind = {'Free only':FREE,'Trials only':TRIAL}.get(self.offer_filter.get())
+            status = self.offer_status_filter.get()
+            rows: list[Offer] = []
+            for offer in self.offers.values():
+                if kind and offer.kind != kind:
+                    continue
+                if status == 'Available only' and not offer.actionable:
+                    continue
+                if status == 'Already subscribed' and offer.status != SUBSCRIBED:
+                    continue
+                rows.append(offer)
+            column, reverse = self.offer_sort
+            rows.sort(key=lambda offer:self._offer_sort_key(offer,column),reverse=reverse)
+            for offer in rows:
+                state = {SUBSCRIBED:'Subscribed',AVAILABLE:'Available'}.get(offer.status,'Claimed earlier')
+                if offer.kind == TRIAL and not offer.code and offer.status == AVAILABLE:
+                    state = 'Claim on website'
+                detail = offer.detail + (f' · {offer.reason}' if offer.reason else '')
+                tags = ('subscribed',) if offer.status == SUBSCRIBED else (
+                       ('used',) if offer.status != AVAILABLE else ())
+                self.offer_tree.insert('', 'end', iid=offer.key, tags=tags,
+                                       values=(f'@{offer.username}',offer.label,'Free',offer.source,state,detail))
+            actionable = sum(1 for offer in self.offers.values() if offer.actionable)
+            if self.offers:
+                self.offer_summary.set(f'Showing {len(rows)} of {len(self.offers)} · '
+                                       f'{actionable} actionable · {len(self.offers) - actionable} read-only')
+            else:
+                self.offer_summary.set('No offers loaded yet.')
+            self._offer_selection_changed()
+        finally:
+            self._offer_refreshing = False
+
+    def _selected_offers(self) -> list[Offer]:
+        if not hasattr(self,'offer_tree'):
+            return []
+        return [self.offers[key] for key in self.offer_tree.selection() if key in self.offers]
+
+    def _offer_selection_changed(self, event=None):
+        if self.worker is not None or not hasattr(self,'offer_action_button'):
+            return
+        actionable = any(offer.actionable for offer in self._selected_offers())
+        self.offer_action_button.state(['!disabled'] if actionable else ['disabled'])
+
+    def scan_offers(self):
+        if self.worker is not None:
+            return
+        try:
+            auth = self.get_auth()
+            extra = parse_profiles(self.offer_names.get())
+        except (AppError,SessionError) as exc:
+            messagebox.showerror('Check setup',str(exc),parent=self.root)
+            return
+        if not (self.scan_active.get() or self.scan_expired.get() or self.scan_messages.get()
+                or self.scan_inbox.get() or self.scan_lists.get()
+                or self.scan_promotions.get() or extra):
+            messagebox.showinfo('Choose a source','Enable at least one scan source or enter a creator name.',parent=self.root)
+            return
+        source = self.rules_source.get().strip()
+        flags = {'include_active':self.scan_active.get(),'include_expired':self.scan_expired.get(),
+                 'include_messages':self.scan_messages.get(),'include_inbox':self.scan_inbox.get(),
+                 'include_lists':self.scan_lists.get(),
+                 'include_promotions':self.scan_promotions.get()}
+        history = OfferHistory.load()
+        self.tabs.select(self.offers_tab)
+        self.offer_status.set('Scan started · reading your subscriptions…')
+        self._offer_scanning = True
+        self.offer_bar.start(12)
+        def run(control,emit):
+            def work(client):
+                return scan_offers(client,control,extra_profiles=extra,history=history,
+                                   emit=emit,**flags)
+            return self._with_client(auth,source,control,emit,work)
+        def done(offers):
+            self._stop_offer_progress()
+            self.offers = {offer.key:offer for offer in offers}
+            self._refresh_offer_tree()
+            actionable = sum(1 for offer in offers if offer.actionable)
+            self.offer_status.set(f'Scan finished · {len(offers)} free/trial row(s) · '
+                                  f'{actionable} actionable · already-subscribed rows stay read-only.')
+            self.status.set('Free & trials scan finished')
+        self.run_task('Scanning free & trial offers',run,done)
+
+    def _stop_offer_progress(self):
+        self._offer_scanning = False
+        try:
+            self.offer_bar.stop()
+            self.offer_bar.configure(value=0)
+        except tk.TclError:
+            pass
+
+    def subscribe_selected(self):
+        if self.worker is not None:
+            return
+        offers = [offer for offer in self._selected_offers() if offer.actionable]
+        if not offers:
+            messagebox.showinfo('Choose offers','Select at least one row marked Available. Already-subscribed rows and trial offers without a code cannot be acted on here.',
+                                parent=self.root)
+            return
+        lines = []
+        for offer in offers:
+            if offer.kind == FREE:
+                lines.append(f'• Free page · @{offer.username} (0 price)')
+            else:
+                lines.append(f'• Free trial · @{offer.username} (claim shared link)')
+        if not messagebox.askokcancel(
+                'Confirm free subscription / trial claim',
+                'These actions are sent to your real account now:\n\n' + '\n'.join(lines) +
+                '\n\nOnly zero-price offers are included. Check renewal settings on the website afterwards. Continue?',
+                parent=self.root):
+            return
+        try:
+            auth = self.get_auth()
+        except SessionError as exc:
+            messagebox.showerror('Session needed',str(exc),parent=self.root)
+            return
+        source = self.rules_source.get().strip()
+        history = OfferHistory.load()
+        def run(control,emit):
+            def work(client):
+                messages: list[str] = []
+                failures: list[str] = []
+                for offer in offers:
+                    control.checkpoint()
+                    try:
+                        messages.append(claim_offer(client,offer,control,history,emit))
+                    except AppError as exc:
+                        failures.append(f'@{offer.username}: {exc}')
+                return messages,failures
+            return self._with_client(auth,source,control,emit,work)
+        def done(result):
+            messages,failures = result
+            self._refresh_offer_tree()
+            if messages:
+                self.offer_status.set(' '.join(messages))
+                self.status.set('Free & trials action completed')
+            if failures:
+                for failure in failures:
+                    self.log(failure)
+                messagebox.showwarning('Some actions were not completed',
+                                       '\n'.join(failures) + '\n\nNothing was repeated for rows that already reported success.',
+                                       parent=self.root)
+        self.run_task('Subscribing to selected free offers',run,done)
+
+    def open_offer_profile(self):
+        offers = self._selected_offers()
+        if not offers:
+            messagebox.showinfo('Open profile','Select a row first.',parent=self.root)
+            return
+        webbrowser.open(offers[0].url)
+
+    def _duplicates_tab(self):
+        parent = self.duplicates_tab
+        ttk.Label(parent,text='Duplicate files in the library',style='Heading.TLabel').pack(anchor='w')
+        ttk.Label(parent,text='Compares file contents (SHA-256) inside one folder tree. Symbolic links are ignored, only media files are read, and nothing is deleted without confirmation.',
+                  style='Muted.TLabel',wraplength=900).pack(anchor='w',pady=(4,12))
+        folder = ttk.Frame(parent)
+        folder.pack(fill='x')
+        ttk.Label(folder,text='Library folder',width=14).pack(side='left')
+        ttk.Entry(folder,textvariable=self.duplicate_dir).pack(side='left',fill='x',expand=True)
+        self.button(folder,'Browse…',self.browse_duplicate_dir,side='left',padx=(8,0))
+        self.button(folder,'Scan for duplicates',self.scan_duplicates,accent=True,side='left',padx=(8,0))
+        ttk.Label(parent,textvariable=self.duplicate_status,style='Muted.TLabel',wraplength=900).pack(anchor='w',pady=(10,0))
+        table = ttk.Frame(parent)
+        table.pack(fill='both',expand=True,pady=(10,0))
+        columns = ('file','size','status')
+        self.duplicate_tree = ttk.Treeview(table,columns=columns,show='tree headings',
+                                           selectmode='extended',height=12)
+        self.duplicate_tree.heading('#0',text='Duplicate group / file')
+        self.duplicate_tree.column('#0',width=520,stretch=True)
+        for column,label,width in (('file','File',0),('size','Size',100),('status','Status',110)):
+            self.duplicate_tree.heading(column,text=label)
+            self.duplicate_tree.column(column,width=width,stretch=column == 'file',
+                                       anchor='e' if column != 'status' else 'w')
+        scrollbar = ttk.Scrollbar(table,orient='vertical',command=self.duplicate_tree.yview)
+        self.duplicate_tree.configure(yscrollcommand=scrollbar.set)
+        self.duplicate_tree.pack(side='left',fill='both',expand=True)
+        scrollbar.pack(side='right',fill='y')
+        actions = ttk.Frame(parent)
+        actions.pack(fill='x',pady=(10,0))
+        self.button(actions,'Use selected copy as keeper',self.keep_selected_duplicate,side='left')
+        self.button(actions,'Delete other copies',self.delete_duplicates,side='left',padx=(8,0))
+        self.button(actions,'Open folder',self.open_duplicate_folder,busy=False,side='left',padx=(8,0))
+        ttk.Label(parent,textvariable=self.duplicate_summary,style='Muted.TLabel').pack(anchor='w',pady=(8,0))
+        ttk.Label(parent,text='The keeper is chosen from the download manifest when possible, otherwise the shortest path. Deleting re-hashes each extra copy first, so changed files are skipped.',
+                  style='Muted.TLabel',wraplength=900).pack(anchor='w',pady=(4,0))
+
+    def _refresh_duplicate_tree(self):
+        if not hasattr(self,'duplicate_tree'):
+            return
+        for item in self.duplicate_tree.get_children():
+            self.duplicate_tree.delete(item)
+        self._dup_files: dict[str,Path] = {}
+        root = self.duplicate_root
+        groups = 0
+        extas = 0
+        for index,group in enumerate(self.duplicate_groups):
+            if len(group.files) < 2:
+                continue
+            groups += 1
+            extas += len(group.extras)
+            group_id = f'group:{index}'
+            self.duplicate_tree.insert('', 'end', iid=group_id, open=True, tags=('dupgroup',),
+                                       text=f'Group {groups} · {readable_bytes(group.size)} each · {len(group.files)} copies',
+                                       values=('',readable_bytes(group.reclaimable),'reclaimable'))
+            for number,path in enumerate(group.files):
+                try:
+                    shown = str(path.resolve().relative_to(root.resolve())) if root else str(path)
+                except (OSError, ValueError):
+                    shown = str(path)
+                keep = path == group.keep
+                iid = f'{group_id}:{number}'
+                self._dup_files[iid] = path
+                self.duplicate_tree.insert(group_id, 'end', iid=iid,
+                                           values=(shown,readable_bytes(group.size),'Keep' if keep else 'Duplicate'),
+                                           tags=('dup-keep',) if keep else ('dup-extra',))
+        total = sum(group.reclaimable for group in self.duplicate_groups if len(group.files) > 1)
+        if groups:
+            self.duplicate_summary.set(f'{groups} group(s) · {extas} extra copy/copies · '
+                                       f'up to {readable_bytes(total)} can be reclaimed')
+        else:
+            self.duplicate_summary.set('No duplicate groups in this folder.')
+
+    def browse_duplicate_dir(self):
+        path = filedialog.askdirectory(title='Choose library folder to check for duplicates')
+        if path:
+            self.duplicate_dir.set(path)
+
+    def scan_duplicates(self):
+        if self.worker is not None:
+            return
+        folder = self.duplicate_dir.get().strip()
+        if not folder:
+            messagebox.showerror('Library folder','Choose the library folder to scan.',parent=self.root)
+            return
+        root = Path(folder).expanduser()
+        if root.is_symlink() or not root.is_dir():
+            messagebox.showerror('Library folder','Choose an existing folder that is not a symbolic link.',parent=self.root)
+            return
+        self.tabs.select(self.duplicates_tab)
+        self.duplicate_status.set('Scanning media files and hashing equal sizes…')
+        def run(control,emit):
+            return find_duplicates(root,control,emit=emit)
+        def done(groups):
+            self.duplicate_root = root
+            self.duplicate_groups = groups
+            self._refresh_duplicate_tree()
+            extras = sum(len(group.extras) for group in groups)
+            self.duplicate_status.set(f'{len(groups)} duplicate group(s) with {extras} extra copy/copies.')
+            self.status.set('Duplicate scan finished')
+        self.run_task('Checking the library for duplicate files',run,done)
+
+    def _selected_duplicate_groups(self) -> list[DuplicateGroup]:
+        if not hasattr(self,'duplicate_tree') or not self.duplicate_groups:
+            return []
+        seen: set[int] = set()
+        result: list[DuplicateGroup] = []
+        for item in self.duplicate_tree.selection():
+            parent = self.duplicate_tree.parent(item) or item
+            try:
+                index = int(str(parent).split(':',1)[1])
+            except (IndexError, ValueError):
+                continue
+            if index in seen or not 0 <= index < len(self.duplicate_groups):
+                continue
+            seen.add(index)
+            result.append(self.duplicate_groups[index])
+        return result
+
+    def keep_selected_duplicate(self):
+        groups = self._selected_duplicate_groups()
+        selection = self.duplicate_tree.selection() if hasattr(self,'duplicate_tree') else ()
+        target = self._dup_files.get(selection[0]) if len(selection) == 1 else None
+        if len(groups) != 1 or target is None:
+            messagebox.showinfo('Choose one copy','Select one file row inside a duplicate group to keep it.',parent=self.root)
+            return
+        group = groups[0]
+        if target not in group.files or not target.is_file():
+            messagebox.showinfo('Choose one copy','That file is no longer available. Scan again.',parent=self.root)
+            return
+        group.keep = target
+        self._refresh_duplicate_tree()
+        self.duplicate_status.set(f'Keeper for this group: {target.name}')
+
+    def delete_duplicates(self):
+        if self.worker is not None:
+            return
+        groups = [group for group in self._selected_duplicate_groups() if len(group.extras) > 0]
+        if not groups:
+            messagebox.showinfo('Delete duplicates','Select one or more duplicate groups or extra copies first.',parent=self.root)
+            return
+        extras = sum(len(group.extras) for group in groups)
+        freed = sum(group.reclaimable for group in groups)
+        if not messagebox.askokcancel(
+                'Delete duplicate copies',
+                f'Delete {extras} extra copy/copies from {len(groups)} group(s)?\n\n'
+                f'Up to {readable_bytes(freed)} will be removed. One copy per group is kept. '
+                'Each file is re-hashed immediately before deletion; changed files are skipped. '
+                'This bypasses the recycle bin and cannot be undone.',
+                parent=self.root):
+            return
+        root = self.duplicate_root
+        if root is None:
+            return
+        def run(control,emit):
+            deleted = freed_bytes = 0
+            errors: list[str] = []
+            for group in groups:
+                control.checkpoint()
+                count, size, problems = delete_extras(group,root,control,emit)
+                deleted += count
+                freed_bytes += size
+                errors.extend(problems)
+            return deleted,freed_bytes,errors
+        def done(result):
+            deleted,freed_bytes,errors = result
+            surviving: list[DuplicateGroup] = []
+            for group in self.duplicate_groups:
+                group.files = [path for path in group.files if path.is_file()]
+                if len(group.files) > 1:
+                    if group.keep not in group.files:
+                        group.keep = group.files[0]
+                    surviving.append(group)
+            self.duplicate_groups = surviving
+            self._refresh_duplicate_tree()
+            self.duplicate_status.set(f'Removed {deleted} file(s); {readable_bytes(freed_bytes)} freed.')
+            self.status.set('Duplicate cleanup finished')
+            if errors:
+                for failure in errors:
+                    self.log(failure)
+                messagebox.showwarning('Some files were kept',
+                                       '\n'.join(errors[:8]) + ('\n…' if len(errors) > 8 else ''),
+                                       parent=self.root)
+        self.run_task('Removing duplicate files',run,done)
+
+    def open_duplicate_folder(self):
+        try:
+            path = Path(self.duplicate_dir.get()).expanduser().resolve()
+            if not path.is_dir():
+                messagebox.showinfo('Library folder','This folder does not exist.',parent=self.root)
+                return
+            if os.name == 'nt':
+                os.startfile(path)
+            elif sys.platform == 'darwin':
+                subprocess.Popen(['open',str(path)])
+            else:
+                subprocess.Popen(['xdg-open',str(path)])
+        except OSError:
+            messagebox.showerror('Open folder','The operating system could not open this folder.',parent=self.root)
 
     def _sync_download_controls(self, *args):
         """Reapply conditional states, including after global busy-state restoration."""
@@ -736,11 +1281,14 @@ class App:
         if not messagebox.askokcancel('Browser session helper','This opens an isolated temporary browser. Log into your own account and complete any normal verification. The app captures session headers locally and closes the helper browser.\n\nYour password is entered only on the website; it is not stored by this app. A blocked browser challenge is not bypassed. Continue?',parent=self.root):
             return
         channel = {'Chromium':'chromium','Google Chrome':'chrome','Microsoft Edge':'msedge'}[self.browser_channel.get()]
-        self.run_task('Browser login',lambda control,emit:capture_session(control,channel=channel,emit=emit),self.apply_credentials)
+        self.run_task('Browser login',lambda control,emit:capture_session(control,channel=channel,emit=emit,
+                                                                          proxy=self.proxy.get().strip()),
+                      self.apply_credentials)
 
     def _with_client(self,auth,source,control,emit,work):
-        rules = load_rules(source,control,emit=emit)
-        with ApiClient(auth,rules,control,emit=emit) as client:
+        proxy = self.proxy.get().strip()
+        rules = load_rules(source,control,emit=emit,proxy=proxy)
+        with ApiClient(auth,rules,control,emit=emit,proxy=proxy) as client:
             return work(client)
 
     def test_session(self):
@@ -769,7 +1317,8 @@ class App:
 
     def refresh_rules(self):
         source = self.rules_source.get().strip()
-        self.run_task('Refreshing public signing rules',lambda control,emit:load_rules(source,control,force=True,emit=emit),
+        self.run_task('Refreshing public signing rules',lambda control,emit:load_rules(
+                          source,control,force=True,emit=emit,proxy=self.proxy.get().strip()),
                       lambda result:self.rules_status.set('Rules refreshed and schema-checked. Use Test session to check whether the platform accepts them.'))
 
     def save_keychain(self):
@@ -907,6 +1456,24 @@ class App:
                 self.status.set(value)
             elif kind == 'stats':
                 self.update_stats(value)
+            elif kind == 'dup_progress':
+                total = int(value.get('total',0) or 0)
+                done = int(value.get('done',0) or 0)
+                self.duplicate_status.set(f'Hashing equal-size files… {done}/{total} · {value.get("file","")}')
+            elif kind == 'offer_progress':
+                labels = {'subscriptions':'Reading subscriptions','inbox':'Reading inbox',
+                          'lists':'Reading custom lists','profiles':'Checking creator profiles',
+                          'promotions':'Checking website promotions',
+                          'messages':'Scanning chat messages','extra':'Checking entered names'}
+                label = labels.get(value.get('phase'),'Scanning')
+                done = int(value.get('done',0) or 0)
+                total = int(value.get('total',0) or 0)
+                if total:
+                    self.offer_status.set(f'{label}… {done}/{total}')
+                elif done:
+                    self.offer_status.set(f'{label}… {done} found')
+                else:
+                    self.offer_status.set(f'{label}…')
             elif kind == 'pipeline':
                 stage = value.get('stage')
                 if stage == 'scan':
@@ -952,11 +1519,17 @@ class App:
             elif kind == 'cancelled':
                 if self.task_title == 'Testing session':
                     self.session_status.set('Session test stopped · not ready; test again before downloading')
+                if self._offer_scanning:
+                    self._stop_offer_progress()
+                    self.offer_status.set('Scan stopped · showing the rows found so far')
                 self.status.set('Stopped')
                 self.log(value)
             elif kind == 'error':
                 if self.task_title == 'Testing session':
                     self.session_status.set('Session test failed · not ready; see the safe diagnostic in Activity')
+                if self._offer_scanning:
+                    self._stop_offer_progress()
+                    self.offer_status.set('Scan failed · see the activity log')
                 self.status.set('Operation failed · check the activity log')
                 self.log(value)
                 if not self.closing and not self.task_quiet:
@@ -969,6 +1542,7 @@ class App:
                 for widget in self.action_widgets:
                     widget.state(['!disabled'])
                 self._sync_download_controls()
+                self._offer_selection_changed()
                 self.stop_button.state(['disabled'])
                 self.pause_button.state(['disabled'])
                 self.pause_button.configure(text='Pause')
@@ -981,8 +1555,9 @@ class App:
             self.poll_id = self.root.after(80,self._poll)
 
     def update_stats(self,values):
+        drm = values.get('drm',0)
         self.stats.set(f"Queued: {values['planned']}  ·  Downloaded: {values['downloaded']}  ·  Existing: {values['existing']}  ·  Duplicates: {values['duplicates']}\n"
-                       f"Filtered: {values['filtered']}  ·  Unavailable / unsupported: {values['unavailable']}  ·  Issues: {values['errors']}  ·  Transferred on completed files: {readable_bytes(values['transferred_bytes'])}")
+                       f"Filtered: {values['filtered']}  ·  Unavailable / unsupported: {values['unavailable']}  ·  DRM-protected (skipped): {drm}  ·  Issues: {values['errors']}  ·  Transferred on completed files: {readable_bytes(values['transferred_bytes'])}")
 
     def log(self,text: str):
         stamp = datetime.now().strftime('%H:%M:%S')
@@ -1075,6 +1650,18 @@ class App:
         except OSError:
             messagebox.showerror('Open folder','The operating system could not open this folder.',parent=self.root)
 
+    def _persistable_proxy(self) -> str:
+        """Store the proxy only when the URL carries no credentials."""
+        value = self.proxy.get().strip()
+        if not value:
+            return ''
+        try:
+            if urlsplit(value).username:
+                return ''
+        except ValueError:
+            return ''
+        return value
+
     def _preference_values(self) -> dict[str,Any]:
         values = {'output_dir':self.output_dir.get(),'rules_source':self.rules_source.get(),
                   'skip_profiles':self.skip_profiles.get(),'profiles':self.profiles_text.get('1.0','end-1c'),
@@ -1082,7 +1669,14 @@ class App:
                   'creator_mode':self.creator_mode.get(), 'date_mode':self.date_mode.get(),
                   'days':self.days.get(), 'since':self.since.get(),
                   'theme':self.theme_mode.get(), 'autoload_session':self.autoload_session.get(),
-                  'auto_check':self.auto_check.get(), 'auto_check_interval':self.auto_check_interval.get()}
+                  'auto_check':self.auto_check.get(), 'auto_check_interval':self.auto_check_interval.get(),
+                  'scan_active':self.scan_active.get(), 'scan_expired':self.scan_expired.get(),
+                  'scan_messages':self.scan_messages.get(), 'offer_names':self.offer_names.get(),
+                  'scan_inbox':self.scan_inbox.get(), 'scan_lists':self.scan_lists.get(),
+                  'scan_promotions':self.scan_promotions.get(),
+                  'offer_filter':self.offer_filter.get(),
+                  'offer_status_filter':self.offer_status_filter.get(),
+                  'duplicate_dir':self.duplicate_dir.get(),'proxy':self._persistable_proxy()}
         values.update({name:var.get() for name,var in self.flags.items()})
         return values
 
@@ -1182,6 +1776,21 @@ class App:
         self.auto_check.set(bool(values.get('auto_check', False)))
         interval = str(values.get('auto_check_interval', '30')).strip()
         self.auto_check_interval.set(interval if interval else '30')
+        for name,var in (('scan_active',self.scan_active),('scan_expired',self.scan_expired),
+                         ('scan_messages',self.scan_messages),('scan_inbox',self.scan_inbox),
+                         ('scan_lists',self.scan_lists),('scan_promotions',self.scan_promotions)):
+            if isinstance(values.get(name),bool):
+                var.set(values[name])
+        self.offer_names.set(str(values.get('offer_names','')))
+        if values.get('offer_filter') in {'All offers','Free only','Trials only'}:
+            self.offer_filter.set(values['offer_filter'])
+        if values.get('offer_status_filter') in {'All statuses','Available only','Already subscribed'}:
+            self.offer_status_filter.set(values['offer_status_filter'])
+        if values.get('duplicate_dir'):
+            self.duplicate_dir.set(str(values['duplicate_dir']))
+        else:
+            self.duplicate_dir.set(self.output_dir.get())
+        self.proxy.set(str(values.get('proxy','')))
         self._apply_theme()
         self._sync_download_controls()
         self._update_creator_summary()

@@ -1,5 +1,148 @@
 # Changes from the supplied onlyfans-dl.py
 
+## Desktop 2.5.0 — 2026-10-22 — broader free/trial scan and visible progress
+
+### Scan sources
+
+- Add **inbox chat partners**: recent chats from `/chats` are read, so creators who
+  wrote to you are covered even when you never subscribed. Up to 80 unknown partners
+  get a profile check; their newest messages are included in the trial-link scan.
+- Add **custom lists**: `/lists` and `/lists/{id}/users` are read, covering favorites
+  and other lists you maintain. Bounded to 20 lists / 400 users per scan.
+- Add **website promo banners**: `/users/promotions` banners are followed. A banner
+  that contains a trial link becomes a claimable trial row; a banner that points to a
+  profile is classified like any other profile. Banner images are never downloaded.
+  Banners that are paid, unreadable or not zero-price are counted and skipped.
+- Still no platform-wide scan: no endpoint enumerates all creators. Inbox, lists and
+  banners only cover creators who contacted you, are in your lists, or are advertised
+  to your account.
+- One row per creator; an actionable shared trial code replaces a code-less offer.
+
+### Feedback
+
+- The tab now has an inline indeterminate progress bar and a status line that names the
+  current phase (`reading subscriptions`, `inbox`, `custom lists`, `promotions`,
+  `chat messages`, `entered names`) with done/total counters.
+- Start, stop, failure and finish each update that line, so a scan never looks idle.
+
+### Paid actions
+
+- Explicitly no new paid subscription and no paid content purchase. Only zero-price
+  free pages and shared free-trial codes can be acted on, after confirmation.
+- Existing paid subscriptions and already purchased content stay downloadable through
+  the normal Downloads tab, including the Purchased category. Download behaviour is
+  unchanged.
+
+### Tests
+
+- 220 local tests pass (214 retained plus inbox, custom-list, promo-banner,
+  paid-banner rejection and progress-event coverage).
+
+---
+
+## Desktop 2.4.0 — 2026-10-22 — explicit proxy/VPN support
+
+### Network
+
+- Add a proxy field on the Session tab and `--proxy` in the CLI. Accepted schemes:
+  `http`, `https`, `socks5`, `socks5h` (remote DNS). Validation rejects paths, query
+  strings, fragments, control characters and out-of-range ports.
+- The same proxy is applied to the account API, public signing-rules download, media
+  downloads and the Playwright browser helper. Media must use the same exit IP as the
+  API because OnlyFans CDN URLs are signed for the requesting IP.
+- Ambient `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` and `.netrc` remain ignored; only the
+  explicit value is used.
+- A proxy URL containing credentials stays in memory and is not persisted to
+  `settings.json`; changing it invalidates the session-test status.
+- SOCKS needs PySocks, added to `requirements.txt`. A missing PySocks now produces a
+  clear message instead of a generic connection failure.
+- Help text documents VPN pitfalls: Cloudflare HTML 403 on VPN ranges, IP-bound signed
+  media URLs, rotating exits, per-IP 429 limits and split tunnels.
+- `Transport` forwards method and JSON body with the proxy on both backends.
+
+### DRM reporting
+
+- `media_task` returns the dedicated reason `drm` for DRM-marked media and `.mpd`/
+  `.m3u8` sources. `RunSummary.drm` counts them; Activity and the CLI summary show
+  `DRM-protected (skipped)` separately from other unavailable media.
+- DRM decryption, key extraction and paid claims remain deliberately unsupported.
+
+### Tests
+
+- 214 local tests pass (208 retained plus proxy validation, proxy propagation to API /
+  rules / media, credential-safe preference persistence, DRM counting).
+
+---
+
+## Desktop 2.3.0 — 2026-10-22 — duplicate library checker
+
+### Interface
+
+- Add a **Duplicates** tab (4) with a library folder field, scan, keeper selection,
+  delete and open-folder actions. Activity moved to tab 5.
+- The tree groups identical files: each group shows the copy size, number of copies and
+  reclaimable bytes; file rows show a relative path, size and Keep/Duplicate state.
+  Group rows and files can be selected; selecting any file row allows making it the
+  keeper.
+- The folder and all scan results are local; the chosen folder is saved in preferences.
+
+### Detection and deletion
+
+- Grouping is content based (SHA-256), not name or media-ID based, so re-downloads and
+  old folder layouts are found. Only files with an identical size are hashed.
+- Hash results are cached in `file_hashes.sqlite3` (config folder) by path, size and
+  `mtime_ns`; unchanged files are not re-read on the next scan.
+- Symbolic links are never followed; hidden files, `.part` files and non-media
+  extensions are skipped; a symlinked root is refused.
+- The keeper is the copy recorded in `.ofdl.sqlite3` when possible, otherwise the
+  shallowest/shortest path with deterministic tie-breaks.
+- Delete other copies requires confirmation, stays inside the chosen folder, skips
+  non-regular files, verifies size, and re-hashes every extra copy immediately before
+  removal. Changed files are kept and reported. Deletion bypasses the recycle bin.
+- New `ofdl/duplicates.py`. No API calls and no uploads are involved.
+- 208 local tests pass (197 retained plus duplicate-detection, cache, keeper and
+  deletion-safety coverage).
+
+---
+
+## Desktop 2.2.0 — 2026-10-22 — free & trial subscriptions tab
+
+### Interface
+
+- Add a **Free & trials** tab (3) before Activity, with source toggles for active
+  subscriptions, expired subscriptions, newest chat messages, and an optional creator
+  list, plus a scan summary.
+- Results are a sortable table: creator, type (Free page / Free trial), price, source,
+  status and details. Filters: All / Free only / Trials only and All statuses /
+  Available only / Already subscribed. Clicking a heading toggles ascending/descending.
+- Rows for pages you already subscribe to are marked and cannot be acted on, so a
+  second subscription is impossible from this tab.
+- **Subscribe selected** only sends after an explicit confirmation dialog listing every
+  row. **Open profile / link** opens the creator page or the shared trial link.
+- Source choices, extra creator names and filters are remembered in preferences.
+  Help text gained a FREE & TRIALS section.
+
+### Detection and actions
+
+- Free page: regular price (`subscribePrice` / `subscribedByData.regularPrice`) is 0.
+- Free trial: current price 0 or a claimable 0 promotion while the regular price is
+  paid. These rules mirror the community OF-Scraper free-trial filter. Paid offers are
+  never returned, so nothing above 0 can be purchased from this tab.
+- Trial links are found in the newest messages (`…/trial/<code>`), deduplicated, and
+  claimed with `POST /api2/v2/trials/claim`. Free pages use
+  `POST /api2/v2/users/{id}/subscribe`.
+- Trial offers with no code remain informational; they are never guessed at.
+- `free_trials.json` remembers free subscriptions and claimed trial codes. Codes are
+  stored as a SHA-256 prefix only, and a matching row is marked "Claimed earlier" on
+  the next scan.
+- New `ofdl/offers.py` holds detection, scanning, claiming and the history store.
+  `ApiClient` gained a signed JSON `post()` sharing the GET path/query signature
+  contract, empty-body tolerance, and `paginate(..., subscription_type=...)` for
+  expired subscriptions.
+- 197 local tests pass (195 retained plus offers, POST and transport coverage).
+
+---
+
 ## Desktop 2.1.1 — 2026-10-12 — Cloudflare-compatible API transport
 
 ### Reported issue

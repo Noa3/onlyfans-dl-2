@@ -13,6 +13,11 @@ public signing-rules download deliberately keeps using plain ``requests``.
 from __future__ import annotations
 
 import requests
+from urllib.parse import unquote, urlsplit
+
+from .common import AppError
+
+PROXY_SCHEMES = {'http', 'https', 'socks5', 'socks5h'}
 
 try:  # Optional: only improves Cloudflare compatibility; absence is not fatal.
     from curl_cffi import requests as _curl_requests
@@ -24,6 +29,58 @@ except Exception:  # pragma: no cover - import guard for missing/odd installs
     HAVE_CURL_CFFI = False
 
 IMPERSONATE = 'chrome'
+
+
+def normalize_proxy(value: str | None) -> str:
+    """Validate one explicit proxy URL and return it unchanged.
+
+    Accepted: http://, https://, socks5:// (local DNS) and socks5h:// (remote
+    DNS via the proxy). Credentials are allowed but are never written to the
+    plaintext preferences file. A proxy is opt-in; ambient *_PROXY environment
+    variables stay ignored unless the user enters one here.
+    """
+    text = str(value or '').strip()
+    if not text:
+        return ''
+    if len(text) > 512 or any(ord(char) < 33 or ord(char) == 127 for char in text):
+        raise AppError('The proxy URL contains spaces or unsupported characters.')
+    try:
+        parsed = urlsplit(text)
+        port = parsed.port
+    except ValueError:
+        raise AppError('The proxy URL is not valid.') from None
+    if parsed.scheme.lower() not in PROXY_SCHEMES:
+        raise AppError('Use an http://, https://, socks5:// or socks5h:// proxy URL.')
+    if not parsed.hostname or parsed.query or parsed.fragment or parsed.path not in {'', '/'}:
+        raise AppError('The proxy URL must be scheme://host:port without a path, query or fragment.')
+    if port is not None and not 1 <= port <= 65535:
+        raise AppError('The proxy port must be between 1 and 65535.')
+    return text
+
+
+def proxy_mapping(value: str) -> dict[str, str] | None:
+    proxy = normalize_proxy(value)
+    return {'http': proxy, 'https': proxy} if proxy else None
+
+
+def playwright_proxy(value: str) -> dict[str, str] | None:
+    proxy = normalize_proxy(value)
+    if not proxy:
+        return None
+    parsed = urlsplit(proxy)
+    scheme = 'socks5' if parsed.scheme.lower() == 'socks5h' else parsed.scheme.lower()
+    host = parsed.hostname or ''
+    if ':' in host:
+        host = f'[{host}]'
+    server = f'{scheme}://{host}'
+    if parsed.port:
+        server += f':{parsed.port}'
+    options = {'server': server}
+    if parsed.username:
+        options['username'] = unquote(parsed.username)
+    if parsed.password:
+        options['password'] = unquote(parsed.password)
+    return options
 
 # Headers a real same-origin XHR sends. They are merged with the authentication and
 # signing headers; rules may still remove individual optional headers.
@@ -42,13 +99,14 @@ NETWORK_ERRORS = (requests.exceptions.RequestException,) + ((CurlRequestsError,)
 
 
 class Transport:
-    """Send a prepared GET through curl_cffi (browser TLS) or plain requests.
+    """Send a prepared request through curl_cffi (browser TLS) or plain requests.
 
     An explicitly injected session is always used as-is, which keeps tests and any
     caller-provided client deterministic and offline-capable.
     """
 
-    def __init__(self, session=None, *, prefer_impersonate: bool = True):
+    def __init__(self, session=None, *, prefer_impersonate: bool = True, proxy: str = ''):
+        self.proxy = normalize_proxy(proxy)
         self.using_curl = session is None and prefer_impersonate and HAVE_CURL_CFFI
         if session is not None:
             self.session = session
@@ -62,6 +120,9 @@ class Transport:
                 getattr(self.session, attribute).clear()
             except Exception:
                 pass
+        mapping = proxy_mapping(self.proxy)
+        if mapping:
+            self.session.proxies = mapping
 
     @property
     def kind(self) -> str:
@@ -69,11 +130,15 @@ class Transport:
 
     def send(self, prepared, *, timeout, verify: bool = True,
              allow_redirects: bool = False, stream: bool = True):
+        mapping = proxy_mapping(self.proxy)
         if self.using_curl:
             timeout = timeout[1] if isinstance(timeout, tuple) else timeout
-            return self.session.request('GET', prepared.url, headers=dict(prepared.headers),
-                                        timeout=timeout, verify=verify, stream=stream,
-                                        allow_redirects=allow_redirects, impersonate=IMPERSONATE)
+            options = {'headers': dict(prepared.headers), 'data': prepared.body,
+                       'timeout': timeout, 'verify': verify, 'stream': stream,
+                       'allow_redirects': allow_redirects, 'impersonate': IMPERSONATE}
+            if mapping:
+                options['proxies'] = mapping
+            return self.session.request(prepared.method, prepared.url, **options)
         return self.session.send(prepared, timeout=timeout, verify=verify,
                                  allow_redirects=allow_redirects, stream=stream)
 

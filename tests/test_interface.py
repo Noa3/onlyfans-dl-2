@@ -160,9 +160,11 @@ class UITests(unittest.TestCase):
         self.addCleanup(self.root.destroy)
 
     def test_ui_builds_all_tabs_and_starts_idle(self):
-        self.assertEqual(len(self.app.tabs.tabs()),4)
+        self.assertEqual(len(self.app.tabs.tabs()),6)
         self.assertEqual(self.app.status.get(),'Ready')
         self.assertIsNone(self.app.worker)
+        self.assertTrue(hasattr(self.app,'duplicate_tree'))
+        self.assertTrue(hasattr(self.app,'offer_tree'))
 
     def test_session_fields_are_masked_by_default(self):
         for name in ['user_id','x_bc','sess_cookie']:
@@ -341,6 +343,18 @@ class UITests(unittest.TestCase):
         self.root.update()
         self.assertTrue(load_preferences(self.app.preferences_path).get('autoload_session'))
         self.app.autoload_session.set(False)
+
+    def test_proxy_credentials_are_never_written_to_preferences(self):
+        self.app.proxy.set('http://user:secret@127.0.0.1:8080')
+        self.app.save_settings()
+        raw = self.app.preferences_path.read_text(encoding='utf-8')
+        self.assertNotIn('secret', raw)
+        self.assertFalse(load_preferences(self.app.preferences_path).get('proxy'))
+        self.app.proxy.set('socks5h://127.0.0.1:1080')
+        self.app.save_settings()
+        self.assertEqual(load_preferences(self.app.preferences_path).get('proxy'),
+                         'socks5h://127.0.0.1:1080')
+        self.app.proxy.set('')
 
     def test_auto_check_schedules_and_cancels(self):
         self.app.auto_check.set(True)

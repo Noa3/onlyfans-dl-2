@@ -144,8 +144,9 @@ class CreatorResolutionTests(unittest.TestCase):
         from test_api import session_for
         session, adapter = session_for([(200, b'fixture', {'Content-Type': 'image/jpeg', 'Content-Length': '7'}),
                                         (200, b'fixture', {'Content-Type': 'image/jpeg', 'Content-Length': '7'})])
-        def downloader(options, user_agent, control, manifest, *, emit):
-            return Downloader(options, user_agent, control, manifest, emit=emit, session=session, retries=0)
+        def downloader(options, user_agent, control, manifest, *, emit, proxy=''):
+            return Downloader(options, user_agent, control, manifest, emit=emit,
+                              session=session, retries=0, proxy=proxy)
         with patch('ofdl.downloads.Downloader', side_effect=downloader):
             summary = run_downloads(self.client, self.options(skip_profiles=('beta',), dry_run=False), Control())
         self.assertEqual(summary.downloaded, 2)

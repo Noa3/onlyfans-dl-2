@@ -174,6 +174,18 @@ class DownloadTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(AppError):
                 validate_media_url(value)
 
+    def test_media_uses_the_same_explicit_proxy_as_the_api(self):
+        manifest = Manifest(self.root)
+        self.addCleanup(manifest.close)
+        worker = Downloader(self.options,'TestBrowser/1.0',Control(),manifest,
+                            proxy='socks5h://user:secret@127.0.0.1:1080')
+        self.addCleanup(worker.close)
+        self.assertEqual(worker.proxy,'socks5h://user:secret@127.0.0.1:1080')
+        self.assertEqual(worker.session.proxies,
+                         {'http':'socks5h://user:secret@127.0.0.1:1080',
+                          'https':'socks5h://user:secret@127.0.0.1:1080'})
+        self.assertFalse(worker.session.trust_env)
+
     def test_profile_parsing_accepts_urls_and_deduplicates(self):
         self.assertEqual(parse_profiles('@Alice, https://onlyfans.com/bob\nALICE'),['alice','bob'])
 
@@ -227,7 +239,12 @@ class DownloadTests(unittest.TestCase):
         post['media'][0]['files']['drm'] = {'manifest':'https://cdn2.onlyfans.com/a.mpd'}
         task, reason = media_task(post,post['media'][0],'42','creator','posts',self.options)
         self.assertIsNone(task)
-        self.assertEqual(reason,'unavailable')
+        self.assertEqual(reason,'drm')
+
+    def test_drm_count_is_reported_separately(self):
+        values = RunSummary().to_dict()
+        self.assertEqual(values['drm'],0)
+        self.assertIn('drm',values)
 
     def test_preview_is_opt_in_and_distinct_from_full(self):
         post = self.post()

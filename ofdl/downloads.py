@@ -16,6 +16,7 @@ import requests
 
 from .api import ApiClient, ApiError, TIMEOUT, wait_retry
 from .common import AppError, Cancelled, Control, EventSink, no_events
+from .http import normalize_proxy, proxy_mapping
 from .settings import atomic_json
 
 CATEGORIES = ('posts','archived','stories','messages','purchased')
@@ -175,7 +176,7 @@ def media_task(post: dict[str,Any], media: dict[str,Any], owner_id: str, profile
         return None,'unavailable'
     files = media.get('files') if isinstance(media.get('files'),dict) else {}
     if media.get('drm') or files.get('drm') or media.get('isDrm'):
-        return None,'unavailable'
+        return None,'drm'
     date = parse_date(media.get('createdAt')) if category == 'stories' else None
     date = date or parse_date(post.get('postedAt')) or parse_date(post.get('createdAt'))
     if options.since is not None and (date is None or date < options.since):
@@ -192,7 +193,7 @@ def media_task(post: dict[str,Any], media: dict[str,Any], owner_id: str, profile
     if not isinstance(url,str) or not url:
         return None,'unavailable'
     if Path(urlsplit(url).path).suffix.lower() in {'.mpd','.m3u8'}:
-        return None,'unavailable'
+        return None,'drm'
     validate_media_url(url)
     media_id = str(media.get('id',''))
     if not re.fullmatch(r'[0-9]{1,24}',media_id):
@@ -405,6 +406,7 @@ class RunSummary:
     duplicates: int = 0
     filtered: int = 0
     unavailable: int = 0
+    drm: int = 0
     errors: int = 0
     transferred_bytes: int = 0
 
@@ -415,7 +417,7 @@ class RunSummary:
 class Downloader:
     def __init__(self, options: Options, user_agent: str, control: Control, manifest: Manifest,
                  *, session: requests.Session | None = None, retries: int = 3,
-                 emit: EventSink = no_events):
+                 emit: EventSink = no_events, proxy: str = ''):
         self.options = options
         self.root = Path(options.output_dir).resolve()
         self.control = control
@@ -426,6 +428,12 @@ class Downloader:
         self.session.trust_env = False
         self.session.headers.clear()
         self.session.cookies.clear()
+        self.proxy = normalize_proxy(proxy)
+        mapping = proxy_mapping(self.proxy)
+        if mapping:
+            # The same proxy as the API must be used here: signed CDN URLs are
+            # bound to the IP that requested them.
+            self.session.proxies = mapping
         self.retries = max(0,min(5,retries))
         self.emit = emit
         self.legacy_index = LegacyIndex(self.root)
@@ -609,6 +617,8 @@ class Downloader:
                 return 'downloaded',bytes_received
             except requests.exceptions.SSLError:
                 raise AppError('TLS verification failed for the media server. Certificate verification remains enabled.') from None
+            except requests.exceptions.InvalidSchema:
+                raise AppError('The configured SOCKS proxy needs the PySocks package from requirements.txt.') from None
             except requests.RequestException:
                 if attempt >= self.retries:
                     raise AppError('The media connection failed or timed out. Partial data is kept; rerun to retry.') from None
@@ -697,6 +707,8 @@ def run_downloads(client: ApiClient, options: Options, control: Control,
                     summary.planned += 1
             elif reason == 'filtered':
                 summary.filtered += 1
+            elif reason == 'drm':
+                summary.drm += 1
             else:
                 summary.unavailable += 1
         emit('stats',summary.to_dict())
@@ -783,7 +795,8 @@ def run_downloads(client: ApiClient, options: Options, control: Control,
     emit('pipeline',{'stage':'download','total':len(queue)})
     with FolderLock(options.output_dir):
         manifest = Manifest(options.output_dir)
-        worker = Downloader(options,client.auth.user_agent,control,manifest,emit=emit)
+        worker = Downloader(options,client.auth.user_agent,control,manifest,emit=emit,
+                            proxy=getattr(client,'proxy',''))
         try:
             for index,task in enumerate(queue.values(),start=1):
                 control.checkpoint()

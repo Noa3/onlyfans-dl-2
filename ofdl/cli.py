@@ -31,6 +31,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--previews',action='store_true',help='Allow a separately named preview when full media is unavailable.')
     parser.add_argument('--scan-only',action='store_true',help='Discover files without downloading media or creating an output folder.')
     parser.add_argument('--rules',default=DEFAULT_RULES_SOURCE,help='Public HTTPS signing-rules source or local JSON file.')
+    parser.add_argument('--proxy',default='',help='Optional http://, https://, socks5:// or socks5h:// proxy for the API, rules and media. Ambient *_PROXY variables stay ignored.')
     parser.add_argument('--refresh-rules',action='store_true',help='Refresh public signing rules and exit.')
     parser.add_argument('--test-session',action='store_true',help='Verify the session and exit.')
     parser.add_argument('--session-stdin',action='store_true',help='Read session JSON, headers, or cURL text from stdin (never executed).')
@@ -47,7 +48,7 @@ def cli_main(args: argparse.Namespace) -> int:
             print(f"Processed {value['done']}/{value['total']} files",flush=True)
     try:
         if args.refresh_rules:
-            load_rules(args.rules,control,force=True,emit=emit)
+            load_rules(args.rules,control,force=True,emit=emit,proxy=args.proxy)
             print('Public signing rules refreshed. Live API compatibility is not implied.')
             return 0
         if args.session_stdin and args.use_keyring:
@@ -71,8 +72,8 @@ def cli_main(args: argparse.Namespace) -> int:
                 raise AppError('--since must be a valid YYYY-MM-DD date.') from None
         elif args.days:
             since = datetime.now(timezone.utc)-timedelta(days=args.days)
-        rules = load_rules(args.rules,control,emit=emit)
-        with ApiClient(auth,rules,control,emit=emit) as client:
+        rules = load_rules(args.rules,control,emit=emit,proxy=args.proxy)
+        with ApiClient(auth,rules,control,emit=emit,proxy=args.proxy) as client:
             if args.test_session:
                 user = client.user('me')
                 print('Session accepted by the account endpoint.')
@@ -87,7 +88,8 @@ def cli_main(args: argparse.Namespace) -> int:
                               subfolders=not args.flat,previews=args.previews,since=since,dry_run=args.scan_only)
             summary = run_downloads(client,options,control,emit)
         print(f'Downloaded: {summary.downloaded}; existing: {summary.existing}; planned: {summary.planned}; '
-              f'filtered: {summary.filtered}; unavailable: {summary.unavailable}; issues: {summary.errors}.')
+              f'filtered: {summary.filtered}; unavailable: {summary.unavailable}; DRM skipped: {summary.drm}; '
+              f'issues: {summary.errors}.')
         return 2 if summary.errors else 0
     except (KeyboardInterrupt,Cancelled):
         control.stop()

@@ -113,6 +113,32 @@ class ApiTests(unittest.TestCase):
         if HAVE_CURL_CFFI:
             self.assertEqual(Transport(None).kind, 'curl_cffi')
 
+    def test_impersonating_transport_forwards_method_and_json_body(self):
+        from ofdl.http import IMPERSONATE, Transport
+
+        class Recorder:
+            args = None
+            def request(self, method, url, **kwargs):
+                self.args = (method, url, kwargs)
+                return 'sent'
+            def close(self):
+                pass
+
+        transport = Transport(None, prefer_impersonate=False)
+        transport.using_curl = True
+        recorder = Recorder()
+        transport.session = recorder
+        prepared = requests.Request('POST', 'https://onlyfans.com/api2/v2/trials/claim',
+                                    json={'code': 'abc'},
+                                    headers={'Content-Type': 'application/json'}).prepare()
+        self.assertEqual(transport.send(prepared, timeout=(1, 2)), 'sent')
+        method, url, kwargs = recorder.args
+        self.assertEqual(method, 'POST')
+        self.assertEqual(url, prepared.url)
+        self.assertEqual(kwargs['data'], b'{"code": "abc"}')
+        self.assertEqual(kwargs['impersonate'], IMPERSONATE)
+        self.assertEqual(kwargs['timeout'], 2)
+
     def test_browser_headers_respect_rule_removals_without_touching_identity(self):
         client, adapter = self.client([(200, {}, {})], dict(RULE_DATA, remove_headers=['Accept-Language']))
         client.request('/users/me')
@@ -374,6 +400,76 @@ class ApiTests(unittest.TestCase):
                 control.wait(10)
         finally:
             timer.cancel()
+
+    def test_post_signs_the_same_path_and_sends_a_json_body(self):
+        client, adapter = self.client([(200,{'success':True},{})])
+        with patch('ofdl.api.time.time', return_value=2000.5):
+            result = client.post('/trials/claim', {'code':'abc_123'})
+        self.assertEqual(result, {'success':True})
+        request = adapter.requests[0]
+        self.assertEqual(request.method, 'POST')
+        self.assertEqual(request.path_url, '/api2/v2/trials/claim')
+        self.assertEqual(request.headers['Content-Type'], 'application/json')
+        self.assertEqual(json.loads(request.body), {'code':'abc_123'})
+        digest = hashlib.sha1(('fixture\n2000500\n/api2/v2/trials/claim\n123').encode()).hexdigest()
+        expected = RULE_DATA['format'].format(digest, abs(sum(ord(digest[i]) for i in [0,3,39]) - 25))
+        self.assertEqual(request.headers['sign'], expected)
+        self.assertIn('session-secret', request.headers['Cookie'])
+
+    def test_post_accepts_an_empty_success_body(self):
+        client, _ = self.client([(200,b'',{})])
+        self.assertEqual(client.post('/users/9/subscribe', {}), {})
+
+    def test_post_keeps_rejecting_unsafe_endpoints(self):
+        client, adapter = self.client([])
+        for endpoint in ['https://evil.example', '/../evil', '/users/1/subscribe?x=1']:
+            with self.subTest(endpoint=endpoint), self.assertRaises(AppError):
+                client.post(endpoint, {})
+        self.assertFalse(adapter.requests)
+
+    def test_expired_subscription_pagination_uses_its_own_type(self):
+        client, adapter = self.client([(200,{'list':[{'id':1}], 'hasMore':False},{})])
+        list(client.paginate('/subscriptions/subscribes','subscriptions',subscription_type='expired'))
+        self.assertIn('type=expired', adapter.requests[0].url)
+        with self.assertRaises(AppError):
+            list(client.paginate('/subscriptions/subscribes','subscriptions',subscription_type='bogus'))
+
+    def test_proxy_is_applied_to_the_api_session(self):
+        from ofdl.http import Transport, normalize_proxy
+        proxied = ApiClient(AUTH, Rules.from_dict(RULE_DATA), Control(), interval=0, retries=0,
+                            proxy='socks5h://user:secret@127.0.0.1:1080')
+        self.addCleanup(proxied.close)
+        self.assertEqual(proxied.proxy, 'socks5h://user:secret@127.0.0.1:1080')
+        self.assertEqual(proxied.transport.session.proxies,
+                         {'http':'socks5h://user:secret@127.0.0.1:1080',
+                          'https':'socks5h://user:secret@127.0.0.1:1080'})
+        self.assertEqual(normalize_proxy(''), '')
+        self.assertEqual(Transport(requests.Session(), proxy='').session.proxies, {})
+
+    def test_proxy_url_validation(self):
+        from ofdl.http import normalize_proxy, playwright_proxy
+        for value in ['http://127.0.0.1:8080', 'https://proxy.example:443',
+                      'socks5://127.0.0.1:1080', 'socks5h://u:p@proxy.example:1080']:
+            with self.subTest(value=value):
+                self.assertEqual(normalize_proxy(value), value)
+        for value in ['ftp://127.0.0.1:21', 'http://', 'http://host:0', 'http://host:70000',
+                      'http://host:8080/path', 'http://host:8080?q=1', 'http://ho st:1', 'x'*600]:
+            with self.subTest(value=value), self.assertRaises(AppError):
+                normalize_proxy(value)
+        self.assertEqual(playwright_proxy('socks5h://u:p%40x@[::1]:1080'),
+                         {'server':'socks5://[::1]:1080','username':'u','password':'p@x'})
+        self.assertIsNone(playwright_proxy(''))
+
+    def test_rules_download_uses_the_same_proxy(self):
+        from tempfile import TemporaryDirectory
+        from pathlib import Path
+        session, adapter = session_for([(200, RULE_DATA, {})])
+        with TemporaryDirectory() as folder:
+            load_rules('https://rules.example/rules.json', Control(),
+                       cache_dir=Path(folder), session=session,
+                       proxy='http://127.0.0.1:3128')
+        self.assertNotIn('Cookie', adapter.requests[0].headers)
+        self.assertEqual(session.proxies['https'], 'http://127.0.0.1:3128')
 
 
 if __name__ == '__main__':

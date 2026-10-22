@@ -22,7 +22,7 @@ from .auth import Credentials
 from .common import AppError, Control, EventSink, no_events
 from .settings import atomic_json, config_dir
 from .diagnostics import ErrorDetails, clock_hint, details_from_json, inspect_error_response
-from .http import BROWSER_HEADERS, NETWORK_ERRORS, Transport
+from .http import BROWSER_HEADERS, NETWORK_ERRORS, Transport, normalize_proxy, proxy_mapping
 
 API_ORIGIN = 'https://onlyfans.com'
 API_URL = API_ORIGIN + '/api2/v2'
@@ -92,7 +92,8 @@ def wait_retry(control: Control, attempt: int, header: str | None, emit: EventSi
     control.wait(delay)
 
 
-def _read_json(response: requests.Response, maximum: int, control: Control) -> Any:
+def _read_json(response: requests.Response, maximum: int, control: Control,
+               *, allow_empty: bool = False) -> Any:
     pieces: list[bytes] = []
     count = 0
     for chunk in response.iter_content(64 * 1024):
@@ -101,8 +102,11 @@ def _read_json(response: requests.Response, maximum: int, control: Control) -> A
         if count > maximum:
             raise AppError('The server response is larger than the configured safety limit.')
         pieces.append(chunk)
+    body = b''.join(pieces)
+    if allow_empty and not body.strip():
+        return {}
     try:
-        return json.loads(b''.join(pieces).decode('utf-8-sig'))
+        return json.loads(body.decode('utf-8-sig'))
     except (ValueError, UnicodeError, RecursionError):
         raise AppError('Expected JSON, but received a different response. A login page, security challenge, or API change may be responsible.') from None
 
@@ -170,7 +174,7 @@ class Rules:
 
 def load_rules(source: str, control: Control, *, force: bool = False,
                cache_dir: Path | None = None, session: requests.Session | None = None,
-               emit: EventSink = no_events) -> Rules:
+               emit: EventSink = no_events, proxy: str = '') -> Rules:
     source = source.strip()
     if not source:
         raise AppError('Choose a signing-rules JSON file or HTTPS source in the Session tab.')
@@ -207,6 +211,9 @@ def load_rules(source: str, control: Control, *, force: bool = False,
     public.trust_env = False  # Avoid implicit .netrc credentials and ambient proxy authentication.
     public.headers.clear()
     public.cookies.clear()
+    mapping = proxy_mapping(proxy)
+    if mapping:
+        public.proxies = mapping
     try:
         for attempt in range(3):
             control.checkpoint()
@@ -244,11 +251,12 @@ def load_rules(source: str, control: Control, *, force: bool = False,
 class ApiClient:
     def __init__(self, auth: Credentials, rules: Rules, control: Control, *,
                  session: requests.Session | None = None, interval: float = 0.6,
-                 retries: int = 3, emit: EventSink = no_events):
+                 retries: int = 3, emit: EventSink = no_events, proxy: str = ''):
         self.auth = auth.validate()
         self.rules = rules
         self.control = control
-        self.transport = Transport(session)
+        self.proxy = normalize_proxy(proxy)
+        self.transport = Transport(session, proxy=self.proxy)
         self.session = self.transport.session
         self.interval = max(0.0, interval)
         self.retries = max(0, min(5, retries))
@@ -278,6 +286,19 @@ class ApiClient:
         return ApiError(response.status_code, details=details, diagnostic=diagnostic)
 
     def request(self, endpoint: str, params: Mapping[str, Any] | None = None) -> Any:
+        return self._request('GET', endpoint, params=params)
+
+    def post(self, endpoint: str, payload: Mapping[str, Any] | None = None) -> Any:
+        """Signed POST with a JSON body.
+
+        Used only by the explicit free-subscription / trial-claim actions the
+        user confirms in the Free & trials tab. This client never starts a
+        purchase or a paid subscription on its own.
+        """
+        return self._request('POST', endpoint, payload=dict(payload or {}))
+
+    def _request(self, method: str, endpoint: str, params: Mapping[str, Any] | None = None,
+                 payload: Mapping[str, Any] | None = None) -> Any:
         if (not isinstance(endpoint,str) or not endpoint.startswith('/') or endpoint.startswith('//')
                 or any(char in endpoint for char in '?\\#\r\n')
                 or any(part in {'.','..'} for part in unquote(endpoint).split('/'))):
@@ -291,7 +312,10 @@ class ApiClient:
                             'app-token':self.rules.app_token,'Referer':API_ORIGIN + '/'})
             # Build locally: works for both the requests and curl_cffi transports and
             # keeps the exact signed path/query independent of the backend.
-            prepared = requests.Request('GET', API_URL + endpoint, params=params, headers=headers).prepare()
+            # GET carries no body; POST bodies are JSON and are not part of the
+            # path-based signing contract.
+            prepared = requests.Request(method, API_URL + endpoint, params=params, headers=headers,
+                                        json=payload if method != 'GET' else None).prepare()
             # Keep the identity used by this authenticated client's signing contract.
             # Some providers publish removal metadata intended for other clients.
             # Apply optional removals first; never sign with an ID then delete it.
@@ -315,12 +339,14 @@ class ApiClient:
                 elif status != 200:
                     raise self._api_error(response, prepared)
                 else:
-                    data = _read_json(response, MAX_API_BYTES, self.control)
+                    data = _read_json(response, MAX_API_BYTES, self.control, allow_empty=method != 'GET')
                     if isinstance(data,dict) and data.get('error'):
                         raise self._api_error(response, prepared, details_from_json(data))
                     return data
             except requests.exceptions.SSLError:
                 raise AppError('TLS certificate verification failed. Check your clock and certificate setup; verification is still enabled.') from None
+            except requests.exceptions.InvalidSchema:
+                raise AppError('The configured proxy scheme cannot be used. SOCKS proxies require the PySocks package from requirements.txt; otherwise use an http:// proxy.') from None
             except NETWORK_ERRORS as exc:
                 if 'ssl' in str(exc).lower() or 'certificate' in str(exc).lower():
                     raise AppError('TLS certificate verification failed. Check your clock and certificate setup; verification is still enabled.') from None
@@ -346,16 +372,19 @@ class ApiClient:
             raise AppError('The returned account does not match the imported session. Import all session fields together from one current logged-in request; account values were withheld.')
         return data
 
-    def paginate(self, endpoint: str, kind: str, *, since: datetime | None = None) -> Iterator[dict[str,Any]]:
+    def paginate(self, endpoint: str, kind: str, *, since: datetime | None = None,
+                 subscription_type: str = 'active') -> Iterator[dict[str,Any]]:
         if kind not in {'posts','archived','stories','messages','purchased','subscriptions'}:
             raise AppError('Unsupported content category.')
+        if subscription_type not in {'active','expired','all'}:
+            raise AppError('Unsupported subscription state.')
         params: dict[str,Any] = {'limit':50}
         if kind == 'messages':
             params['order'] = 'desc'
         elif kind != 'subscriptions':
             params['order'] = 'publish_date_asc'
         if kind == 'subscriptions':
-            params['type'] = 'active'
+            params['type'] = subscription_type
         if kind in {'posts','archived'} and since is not None:
             params['afterPublishTime'] = f'{since.timestamp():.6f}'
         seen: set[str] = set()
