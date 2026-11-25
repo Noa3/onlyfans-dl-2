@@ -5,8 +5,8 @@ module answers the other question: are the same bytes stored twice on disk (old
 folder layouts, re-downloads under a different name, copied profile trees)?
 
 Only files inside the chosen library folder are read. Nothing is deleted without
-an explicit confirmation, and every extra copy is re-hashed immediately before it
-is removed so a changed file is never lost. Symbolic links are never followed.
+an explicit confirmation. Both keeper and extra are re-hashed before deletion;
+a missing, changed or unsafe keeper stops deletion for the group.
 """
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
-from .common import AppError, Control, EventSink, no_events
+from .common import AppError, Cancelled, Control, EventSink, no_events
 from .downloads import MEDIA_EXTENSIONS
 from .settings import config_dir
 
@@ -233,6 +233,28 @@ def _choose_keeper(root: Path, files: list[Path], recorded: set[str]) -> Path:
     return sorted(files, key=score)[0]
 
 
+def _verify_copy(path: Path, group: DuplicateGroup, root: Path, control: Control) -> os.stat_result:
+    """Validate a live copy, including changes while hashing it."""
+    _inside(root, path)
+    # Reject links in ancestor directories too, including Windows junctions.
+    for part in (path, *path.parents):
+        if part.is_symlink() or getattr(part, 'is_junction', lambda: False)():
+            raise AppError('Copy uses a symbolic link or junction; scan again.')
+    if not path.is_file():
+        raise AppError('Copy is no longer a regular file; scan again.')
+    before = path.stat()
+    if before.st_size != group.size or hash_file(path, control) != group.digest:
+        raise AppError('Copy size or content changed; scan again.')
+    after = path.stat()
+    if _file_stamp(before) != _file_stamp(after):
+        raise AppError('Copy changed while being verified; scan again.')
+    return after
+
+
+def _file_stamp(info: os.stat_result) -> tuple[int, int, int, int, int]:
+    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+
+
 def delete_extras(group: DuplicateGroup, root: Path, control: Control,
                   emit: EventSink = no_events) -> tuple[int, int, list[str]]:
     """Delete non-kept copies after re-verifying size and content. Returns stats."""
@@ -245,21 +267,28 @@ def delete_extras(group: DuplicateGroup, root: Path, control: Control,
     for path in group.extras:
         control.checkpoint()
         try:
-            _inside(root, path)
-            if path.is_symlink() or not path.is_file():
-                errors.append(f'{path.name}: skipped, no longer a regular file')
+            info = _verify_copy(path, group, root, control)
+            # Verify the survivor after hashing the extra, immediately before
+            # deletion. A missing/changed keeper stops this entire group.
+            try:
+                _verify_copy(group.keep, group, root, control)
+            except Cancelled:
+                raise
+            except (OSError, AppError):
+                errors.append('Keeper missing, changed or unsafe; remaining copies were kept. Scan again.')
+                break
+            if path.samefile(group.keep):
+                errors.append(f'{path.name}: skipped, same file as keeper')
                 continue
-            info = path.stat()
-            if info.st_size != group.size:
-                errors.append(f'{path.name}: skipped, size changed')
-                continue
-            if hash_file(path, control) != group.digest:
-                errors.append(f'{path.name}: skipped, content changed')
+            if _file_stamp(info) != _file_stamp(path.stat()):
+                errors.append(f'{path.name}: skipped, changed during verification')
                 continue
             path.unlink()
             deleted += 1
             freed += info.st_size
             emit('log', f'Removed duplicate: {path}')
+        except Cancelled:
+            raise
         except (OSError, AppError) as exc:
             errors.append(f'{path.name}: {exc}')
     return deleted, freed, errors

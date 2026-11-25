@@ -420,6 +420,26 @@ class ApiTests(unittest.TestCase):
         client, _ = self.client([(200,b'',{})])
         self.assertEqual(client.post('/users/9/subscribe', {}), {})
 
+    def test_post_never_retries_an_ambiguous_response_or_connection_failure(self):
+        for reply in [(500, {}, {}), (429, {}, {'Retry-After':'1'}),
+                      requests.exceptions.ReadTimeout('private detail'),
+                      requests.exceptions.ConnectionError('private detail')]:
+            with self.subTest(reply=type(reply).__name__):
+                client, adapter = self.client([reply, (200, {}, {})])
+                client.retries = 3
+                with patch('ofdl.api.wait_retry') as wait:
+                    with self.assertRaises(AppError):
+                        client.post('/trials/claim', {'code':'test-only'})
+                self.assertEqual(len(adapter.requests), 1)
+                wait.assert_not_called()
+
+    def test_get_still_retries_transient_errors(self):
+        client, adapter = self.client([(500, {}, {}), (200, {'id':123}, {})])
+        client.retries = 1
+        with patch('ofdl.api.wait_retry'):
+            self.assertEqual(client.user()['id'], 123)
+        self.assertEqual(len(adapter.requests), 2)
+
     def test_post_keeps_rejecting_unsafe_endpoints(self):
         client, adapter = self.client([])
         for endpoint in ['https://evil.example', '/../evil', '/users/1/subscribe?x=1']:

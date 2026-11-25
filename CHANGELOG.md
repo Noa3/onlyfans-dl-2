@@ -1,5 +1,89 @@
 # Changes from the supplied onlyfans-dl.py
 
+## Desktop 2.8.0 — 2026-10-22 — free/trial claims and deeper discovery
+
+- Re-enable **Subscribe / claim selected** for zero-price offers after explicit
+  confirmation. Free pages are re-read immediately before the POST and refused when
+  no longer free or already subscribed; shared trial codes are sent to the trial
+  claim endpoint. Code-less trials, paid pages and subscribed rows stay read-only.
+- Never retry POSTs. Record successful claims in `free_trials.json` (trial codes as
+  hashes) and update row status. Warn that trials auto-renew at the regular price.
+- Search expired creators' newest chat messages for fresh trial links. Add a Deep
+  scan option for more chat pages/partners, lists and list users, plus a table search
+  box. Persist the search text and deep-scan preference.
+- Cover zero-price gating, price-change refusal, duplicate-code refusal, server-side
+  subscription detection, expired-chat discovery, deep limits, UI confirmation and
+  non-actionable row skipping with tests.
+
+---
+
+## Desktop 2.7.0 — 2026-10-22 — opt-in automatic livestream recording
+
+- Add persisted automatic monitoring of active subscriptions, with optional creator
+  include/skip filters, 30–3600-second polling and 1–4 simultaneous recordings.
+- Discover live flags and stream IDs through signed GET requests; adapt the browser
+  MediaRecorder/audio-tap approach from OF-Scraper-GUI Live Stream Monitor (MIT notice
+  included). Native Agora SDK capture is not used.
+- Record WebRTC video plus direct, detached-element or Web Audio audio in temporary
+  browser contexts. Write ordered, bounded chunks to WebM partial files, flush on
+  stop/end/duration limit, retain partial recordings on errors, and mark video-only
+  recordings explicitly. Stop captures after two successful offline scans or a stall.
+- Add one-click browser setup, per-stream status/file table, stop-selected, stop-all,
+  per-session ID deduplication, three-attempt cooldowns and API error backoff. Settings
+  changes stop and restart monitoring; closing waits for cleanup and retains opt-in.
+- Restrict browser account writes to the exact empty viewing heartbeat; block
+  purchases, subscriptions, tips and join POSTs. No persistent browser profiles,
+  token dumps or plaintext credential preferences are introduced.
+- Verify discovery, scheduler cancellation/dedup/retry behavior, UI opt-in/shutdown,
+  and locally generated browser audio/video capture with FFmpeg decoding. Platform
+  API/player compatibility has not been tested against a real account livestream.
+
+---
+
+## Desktop 2.6.0 — 2026-10-22 — overlapping downloads and live recording
+
+- Download discovered media while API paging continues, through a bounded 64-item
+  queue. The media thread owns its HTTP session, SQLite manifest and folder lock;
+  summary snapshots are serialized. Failure/cancellation joins the worker and keeps
+  completed files. Scan-only and empty scans create no output files.
+- Show growing totals during discovery and final progress/ETA only after scanning.
+- Add an independent Live recording tab accepting direct accessible HTTPS OnlyFans
+  HLS URLs, with Start, Stop-and-save, output directory, label and duration limit.
+  Capture clear muxed MPEG-TS or fragmented MP4, follow sequence numbers, preserve
+  partial recordings on errors and save completed segments on stop.
+- Reuse the explicit proxy without forwarding account credentials. Validate playlist,
+  rendition, initialization, segment and redirect URLs. Reject encrypted playlists,
+  separate audio tracks, byte ranges, sequence gaps and unsupported discontinuities.
+- Add `m3u8` for playlist parsing. Recording itself does not require FFmpeg.
+- Add deterministic concurrency/cancellation tests, simulated HLS progression and
+  error tests, independent recorder UI lifecycle tests, and optional local FFmpeg
+  encode/record/decode integration coverage. No live-account endpoint validation is
+  implied; automatic stream URL discovery is not implemented.
+
+---
+
+## Desktop 2.5.1 — 2026-10-22 — review fixes
+
+- Disable automatic free subscriptions and trial claims until a server-enforced
+  zero-price contract is verified. Scanned prices do not establish that guarantee;
+  a fresh lookup alone cannot prevent a price-change race. Links open for manual
+  website review. Existing paid subscriptions and purchases remain downloadable.
+- Stop duplicate deletion when the keeper is missing, changed, outside the library,
+  or uses links/junctions. Re-hash the keeper before each deletion, detect file
+  changes during verification, and propagate cancellation rather than swallowing it.
+- Restrict automatic API retries to GET; never retry a POST after a timeout/5xx/429.
+- Stream snapshot rows to the UI, retain partial results after cancellation/errors,
+  and mark scans incomplete when an optional source fails. Preserve prior list-page
+  results and continue other lists. Authentication failures and rate limits stop scans.
+- Exclude password-only proxy URLs from plaintext preferences; snapshot proxy values
+  before worker launch and include proxy changes in in-flight session validation.
+- Count unsupported streaming manifests separately from explicit DRM metadata.
+- Extract tab layouts into `ui_offers.py` and `ui_duplicates.py`.
+- Add regression coverage for keeper changes, account-action blocking, POST retries,
+  source failures, partial results, proxy threading/privacy, and streaming counters.
+
+---
+
 ## Desktop 2.5.0 — 2026-10-22 — broader free/trial scan and visible progress
 
 ### Scan sources
@@ -35,8 +119,8 @@
 
 ### Tests
 
-- 220 local tests pass (214 retained plus inbox, custom-list, promo-banner,
-  paid-banner rejection and progress-event coverage).
+- 220 local tests executed: 219 passed, 1 skipped (including inbox, custom-list,
+  promo-banner, paid-banner rejection and progress-event coverage).
 
 ---
 

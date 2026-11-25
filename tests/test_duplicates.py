@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from ofdl.common import AppError, Control
+from ofdl.common import AppError, Cancelled, Control
 from ofdl.duplicates import (DuplicateGroup, HashCache, delete_extras, find_duplicates,
                              hash_file, iter_media_files)
 
@@ -113,6 +113,69 @@ class DuplicateTests(unittest.TestCase):
         self.assertEqual((deleted, freed), (0, 0))
         self.assertTrue(extra.exists())
         self.assertTrue(any('content changed' in error for error in errors))
+
+    def test_missing_or_changed_keeper_preserves_every_extra(self):
+        for change in ('missing', 'size', 'content'):
+            with self.subTest(change=change):
+                keep = write(self.root / 'keep.jpg', b'x' * 70)
+                extras = [write(self.root / f'extra{i}.jpg', b'x' * 70) for i in range(2)]
+                group = DuplicateGroup(hash_file(keep, self.control), 70, [keep, *extras], keep)
+                if change == 'missing':
+                    keep.unlink()
+                else:
+                    keep.write_bytes(b'y' * (70 if change == 'content' else 3))
+                deleted, freed, errors = delete_extras(group, self.root, self.control)
+                self.assertEqual((deleted, freed), (0, 0))
+                self.assertTrue(all(path.exists() for path in extras))
+                self.assertTrue(any('Keeper' in error for error in errors))
+
+    def test_keeper_changed_while_hashing_extra_is_detected(self):
+        keep = write(self.root / 'keep.jpg', b'x' * 70)
+        extra = write(self.root / 'extra.jpg', b'x' * 70)
+        group = DuplicateGroup(hash_file(keep, self.control), 70, [keep, extra], keep)
+        def changing_hash(path, control):
+            digest = hash_file(path, control)
+            if path == extra:
+                keep.write_bytes(b'y' * 70)
+            return digest
+        with patch('ofdl.duplicates.hash_file', side_effect=changing_hash):
+            result = delete_extras(group, self.root, self.control)
+        self.assertEqual(result[0], 0)
+        self.assertEqual(extra.read_bytes(), b'x' * 70)
+
+    def test_keeper_disappearing_between_deletions_preserves_remaining_copy(self):
+        keep = write(self.root / 'keep.jpg', b'x' * 70)
+        first = write(self.root / 'first.jpg', b'x' * 70)
+        last = write(self.root / 'last.jpg', b'x' * 70)
+        group = DuplicateGroup(hash_file(keep, self.control), 70, [keep, first, last], keep)
+        def remove_keeper(kind, value):
+            if kind == 'log':
+                keep.unlink()
+        result = delete_extras(group, self.root, self.control, remove_keeper)
+        self.assertEqual(result[0], 1)
+        self.assertTrue(last.exists())
+        self.assertTrue(result[2])
+
+    def test_keeper_outside_library_is_refused(self):
+        keep = write(self.root.parent / 'outside.jpg', b'x' * 70)
+        extra = write(self.root / 'extra.jpg', b'x' * 70)
+        group = DuplicateGroup(hash_file(keep, self.control), 70, [keep, extra], keep)
+        result = delete_extras(group, self.root, self.control)
+        self.assertEqual(result[0], 0)
+        self.assertTrue(extra.exists())
+
+    def test_cancellation_during_keeper_verification_propagates(self):
+        keep = write(self.root / 'keep.jpg', b'x' * 70)
+        extra = write(self.root / 'extra.jpg', b'x' * 70)
+        group = DuplicateGroup(hash_file(keep, self.control), 70, [keep, extra], keep)
+        def stopped_hash(path, control):
+            if path == keep:
+                control.stop()
+            return hash_file(path, control)
+        with patch('ofdl.duplicates.hash_file', side_effect=stopped_hash):
+            with self.assertRaises(Cancelled):
+                delete_extras(group, self.root, self.control)
+        self.assertTrue(extra.exists())
 
     def test_file_outside_the_library_is_refused(self):
         outside = write(Path(self.temp.name) / 'outside.jpg', b'x' * 70)

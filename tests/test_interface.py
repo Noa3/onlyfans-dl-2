@@ -160,11 +160,183 @@ class UITests(unittest.TestCase):
         self.addCleanup(self.root.destroy)
 
     def test_ui_builds_all_tabs_and_starts_idle(self):
-        self.assertEqual(len(self.app.tabs.tabs()),6)
+        self.assertEqual(len(self.app.tabs.tabs()),7)
         self.assertEqual(self.app.status.get(),'Ready')
         self.assertIsNone(self.app.worker)
         self.assertTrue(hasattr(self.app,'duplicate_tree'))
         self.assertTrue(hasattr(self.app,'offer_tree'))
+        self.assertFalse(self.app.live_tab.running)
+
+    def finish_live(self):
+        deadline = time.monotonic()+3
+        while self.app.live_tab.running and time.monotonic()<deadline:
+            self.root.update()
+            time.sleep(.01)
+        self.assertFalse(self.app.live_tab.running)
+
+    def test_live_recording_is_independent_of_download_stop_and_keeps_url_private(self):
+        from ofdl.common import Cancelled
+        from ofdl.live import RecordingResult
+        live_started = threading.Event()
+        normal_started = threading.Event()
+        def normal(control, emit):
+            normal_started.set()
+            control.wait(60)
+        def recording(options, control, emit):
+            self.assertEqual(options.proxy,'http://127.0.0.1:8080')
+            live_started.set()
+            try:
+                control.wait(60)
+            except Cancelled:
+                return RecordingResult(None,0,0,0,'stopped')
+        self.app.live_tab.url.set('https://cdn2.onlyfans.com/live.m3u8?secret=private-live-token')
+        self.app.proxy.set('http://127.0.0.1:8080')
+        with patch('ofdl.ui_live.record_live',side_effect=recording), \
+                patch('ofdl.ui_live.messagebox.showerror') as error:
+            self.app.run_task('Download fixture',normal)
+            self.assertTrue(normal_started.wait(2))
+            self.app.live_tab.start()
+            self.assertTrue(live_started.wait(2))
+            self.assertIsNot(self.app.control,self.app.live_tab.control)
+            self.app.stop()
+            self.finish_task()
+            self.assertTrue(self.app.live_tab.running)
+            self.assertFalse(self.app.live_tab.control.stopped.is_set())
+            self.app.live_tab.stop()
+            self.finish_live()
+            error.assert_not_called()
+        self.app.save_settings()
+        self.assertNotIn('private-live-token',self.app.preferences_path.read_text(encoding='utf-8'))
+        self.assertNotIn('private-live-token',self.app.log_text.get('1.0','end'))
+
+    def test_close_waits_for_live_recorder_shutdown(self):
+        from ofdl.common import Cancelled
+        from ofdl.live import RecordingResult
+        started = threading.Event()
+        def recording(options, control, emit):
+            started.set()
+            try:
+                control.wait(60)
+            except Cancelled:
+                return RecordingResult(None,0,0,0,'stopped')
+        self.app.live_tab.url.set('https://cdn2.onlyfans.com/live.m3u8')
+        with patch('ofdl.ui_live.record_live',side_effect=recording), patch.object(self.root,'destroy') as destroy:
+            self.app.live_tab.start()
+            self.assertTrue(started.wait(2))
+            self.app.close()
+            self.assertTrue(self.app.live_tab.control.stopped.is_set())
+            destroy.assert_not_called()
+            self.finish_live()
+            deadline = time.monotonic()+2
+            while not destroy.called and time.monotonic()<deadline:
+                self.root.update()
+                time.sleep(.01)
+            destroy.assert_called_once()
+
+    def test_growing_download_queue_does_not_display_fixed_total_eta(self):
+        self.app.events.put(('pipeline',{'stage':'streaming'}))
+        self.app.events.put(('overall',{'done':3,'total':5,'scanning':True}))
+        self.root.after_cancel(self.app.poll_id)
+        self.app._poll()
+        self.assertIn('found so far',self.app.overall_status.get())
+        self.assertEqual(str(self.app.pipeline_progress.cget('mode')),'indeterminate')
+        self.app.events.put(('pipeline',{'stage':'download','total':8}))
+        self.app.events.put(('overall',{'done':4,'total':8,'scanning':False}))
+        self.root.after_cancel(self.app.poll_id)
+        self.app._poll()
+        self.assertIn('50%',self.app.pipeline_status.get())
+
+    def test_live_auto_opt_in_is_persisted_without_session_or_url(self):
+        live = self.app.live_tab
+        self.assertFalse(live.enabled.get())
+        live.enabled.set(True)
+        live.include.set('alice bob')
+        live.exclude.set('bob')
+        live.interval.set('90')
+        live.url.set('https://cdn2.onlyfans.com/private.m3u8?token=hidden')
+        live.auto_changed()
+        saved = load_preferences(self.app.preferences_path)
+        self.assertTrue(saved['live_enabled'])
+        self.assertEqual(saved['live_include'],'alice bob')
+        self.assertEqual(saved['live_interval'],'90')
+        self.assertNotIn('hidden',self.app.preferences_path.read_text())
+        live.enabled.set(False)
+        live.load_preferences(saved)
+        self.assertTrue(live.enabled.get())
+        live.maybe_watch()
+        self.assertIsNone(live.watch_worker)
+        self.assertIn('Waiting',live.watch_status.get())
+        live.enabled.set(False)
+
+    def test_auto_watch_snapshots_inputs_and_restarts_after_proxy_change(self):
+        from ofdl.live_watch import LiveWatcher
+        live = self.app.live_tab
+        self.app.apply_credentials(Credentials('123','UA','bc','secret'))
+        self.app.proxy.set('http://127.0.0.1:8080')
+        started = threading.Event()
+        snapshots = []
+        def run(watcher):
+            snapshots.append((watcher.auth,watcher.options.proxy))
+            started.set()
+            try:
+                watcher.control.wait(60)
+            except Cancelled:
+                pass
+        with patch.object(LiveWatcher,'run',run):
+            live.enabled.set(True)
+            live.auto_changed()
+            live.maybe_watch()
+            self.assertTrue(started.wait(2))
+            original = live.watch_control
+            self.assertEqual(snapshots[0][1],'http://127.0.0.1:8080')
+            self.app.proxy.set('http://127.0.0.1:8081')
+            live.next_auto_check = 0
+            live.maybe_watch()
+            self.assertTrue(original.stopped.is_set())
+            live.stop()
+            self.finish_live()
+        self.assertFalse(live.enabled.get())
+
+    def test_auto_watch_error_is_latched_until_user_retries(self):
+        live = self.app.live_tab
+        self.app.apply_credentials(Credentials('123','UA','bc','secret'))
+        with patch('ofdl.ui_live.LiveWatcher.run',side_effect=AppError('Session rejected')) as run:
+            live.enabled.set(True)
+            live.auto_changed()
+            live.maybe_watch()
+            self.finish_live()
+            self.assertEqual(live.watch_status.get(),'Session rejected')
+            live.next_auto_check = 0
+            live.maybe_watch()
+            self.assertEqual(run.call_count,1)
+            live.enabled.set(False)
+
+    def test_close_stops_auto_monitor_and_preserves_opt_in(self):
+        from ofdl.live_watch import LiveWatcher
+        live = self.app.live_tab
+        self.app.apply_credentials(Credentials('123','UA','bc','secret'))
+        started = threading.Event()
+        def run(watcher):
+            started.set()
+            try:
+                watcher.control.wait(60)
+            except Cancelled:
+                pass
+        with patch.object(LiveWatcher,'run',run),patch.object(self.root,'destroy') as destroy:
+            live.enabled.set(True)
+            live.auto_changed()
+            live.maybe_watch()
+            self.assertTrue(started.wait(2))
+            self.app.close()
+            self.assertTrue(live.watch_control.stopped.is_set())
+            self.assertTrue(live.enabled.get())
+            self.assertTrue(load_preferences(self.app.preferences_path)['live_enabled'])
+            self.finish_live()
+            deadline = time.monotonic()+2
+            while not destroy.called and time.monotonic()<deadline:
+                self.root.update()
+                time.sleep(.01)
+            destroy.assert_called_once()
 
     def test_session_fields_are_masked_by_default(self):
         for name in ['user_id','x_bc','sess_cookie']:
@@ -345,16 +517,155 @@ class UITests(unittest.TestCase):
         self.app.autoload_session.set(False)
 
     def test_proxy_credentials_are_never_written_to_preferences(self):
-        self.app.proxy.set('http://user:secret@127.0.0.1:8080')
-        self.app.save_settings()
-        raw = self.app.preferences_path.read_text(encoding='utf-8')
-        self.assertNotIn('secret', raw)
-        self.assertFalse(load_preferences(self.app.preferences_path).get('proxy'))
+        for url in ('http://user:secret@127.0.0.1:8080',
+                    'http://:secret@127.0.0.1:8080',
+                    'socks5h://secret@127.0.0.1:1080'):
+            with self.subTest(url=url):
+                self.app.proxy.set(url)
+                self.app.save_settings()
+                raw = self.app.preferences_path.read_text(encoding='utf-8')
+                self.assertNotIn('secret', raw)
+                self.assertFalse(load_preferences(self.app.preferences_path).get('proxy'))
         self.app.proxy.set('socks5h://127.0.0.1:1080')
         self.app.save_settings()
         self.assertEqual(load_preferences(self.app.preferences_path).get('proxy'),
                          'socks5h://127.0.0.1:1080')
         self.app.proxy.set('')
+
+    def test_network_tasks_snapshot_proxy_on_main_thread(self):
+        from ofdl.downloads import RunSummary
+        auth = Credentials('123','UA','bc','secret')
+        self.app.apply_credentials(auth)
+        original_get = self.app.proxy.get
+        main_thread = threading.get_ident()
+        def main_thread_get():
+            self.assertEqual(threading.get_ident(), main_thread, 'Tk proxy read from worker')
+            return original_get()
+        actions = [self.app.test_session, self.app.refresh_rules, self.app.browser_login,
+                   self.app.scan_offers, lambda:self.app.start_download(True)]
+        for action in actions:
+            with self.subTest(action=action):
+                self.app.proxy.set('http://127.0.0.1:8080')
+                with patch.object(self.app.proxy, 'get', side_effect=main_thread_get), \
+                        patch('ofdl.ui.load_rules') as rules, patch('ofdl.ui.ApiClient') as api, \
+                        patch('ofdl.ui.capture_session', return_value=auth) as capture, \
+                        patch('ofdl.ui.scan_offers', return_value=[]), \
+                        patch('ofdl.ui.run_downloads', return_value=RunSummary()), \
+                        patch('ofdl.ui.messagebox.askokcancel', return_value=True), \
+                        patch('ofdl.ui.messagebox.showerror') as error:
+                    api.return_value.__enter__.return_value.user.return_value = {'id':123}
+                    action()
+                    self.app.proxy.set('http://127.0.0.1:9090')
+                    self.finish_task()
+                    error.assert_not_called()
+                    calls = rules.call_args_list + capture.call_args_list
+                    self.assertTrue(calls)
+                    self.assertTrue(all(call.kwargs['proxy'] == 'http://127.0.0.1:8080' for call in calls))
+
+    def test_proxy_edit_during_session_test_invalidates_result(self):
+        self.app.apply_credentials(Credentials('123','UA','bc','secret'))
+        ready = threading.Event()
+        def response(*args):
+            ready.wait(1)
+            return {'id':123}
+        with patch.object(self.app, '_with_client', side_effect=response):
+            self.app.test_session()
+            self.app.proxy.set('http://127.0.0.1:8080')
+            ready.set()
+            self.finish_task()
+        self.assertIn('changed', self.app.session_status.get())
+
+    def test_cancelled_offer_scan_keeps_new_partial_rows_and_clears_old_scan(self):
+        from ofdl.common import Cancelled
+        from ofdl.offers import classify, SUBSCRIBED
+        old = classify({'id':1,'username':'old','subscribePrice':0}, source='fixture')
+        new = classify({'id':2,'username':'new','subscribePrice':0}, source='fixture', status=SUBSCRIBED)
+        self.app.offers = {old.key:old}
+        self.app.apply_credentials(Credentials('123','UA','bc','secret'))
+        def stopped(client, control, **kwargs):
+            kwargs['emit']('offer_row', {'offer':new, 'remove':None})
+            raise Cancelled('Stopped fixture')
+        def local_client(auth, source, control, emit, work, proxy):
+            return work(object())
+        with patch.object(self.app, '_with_client', side_effect=local_client), \
+                patch('ofdl.ui.scan_offers', side_effect=stopped):
+            self.app.scan_offers()
+            self.finish_task()
+        self.assertEqual(list(self.app.offers), [new.key])
+        self.assertEqual(self.app.offer_tree.get_children(), (new.key,))
+        self.assertIn('1 partial row(s)', self.app.offer_status.get())
+        self.assertFalse(self.app._offer_scanning)
+        self.assertTrue(self.app.offer_action_button.instate(['disabled']))
+
+    def test_optional_source_warning_marks_scan_incomplete(self):
+        self.app.apply_credentials(Credentials('123','UA','bc','secret'))
+        def incomplete(client, control, **kwargs):
+            kwargs['emit']('offer_warning', {'source':'promotions', 'message':'Unavailable'})
+            return []
+        def local_client(auth, source, control, emit, work, proxy):
+            return work(object())
+        with patch.object(self.app, '_with_client', side_effect=local_client), \
+                patch('ofdl.ui.scan_offers', side_effect=incomplete):
+            self.app.scan_offers()
+            self.finish_task()
+        self.assertIn('Scan incomplete', self.app.offer_status.get())
+        self.assertIn('1 source warning(s)', self.app.offer_status.get())
+
+    def test_offer_action_button_enables_for_zero_price_candidates(self):
+        from ofdl.offers import classify
+        offer = classify({'id':2,'username':'new','subscribePrice':0}, source='fixture')
+        self.app.offers = {offer.key:offer}
+        self.app.offer_status_filter.set('Available only')
+        self.app._refresh_offer_tree()
+        self.app.offer_tree.selection_set(offer.key)
+        self.root.update()
+        self.assertEqual(self.app.offer_tree.get_children(), (offer.key,))
+        self.assertFalse(self.app.offer_action_button.instate(['disabled']))
+        with patch('ofdl.ui.webbrowser.open') as browser:
+            self.app.open_offer_profile()
+        browser.assert_called_once_with('https://onlyfans.com/new')
+
+    def test_subscribe_selected_requires_confirmation_and_skips_non_actionable_rows(self):
+        from ofdl.offers import classify, SUBSCRIBED
+        free = classify({'id':2,'username':'new','subscribePrice':0}, source='fixture')
+        used = classify({'id':3,'username':'old','subscribePrice':0}, source='fixture',
+                        status=SUBSCRIBED)
+        self.app.offers = {free.key:free, used.key:used}
+        self.app._refresh_offer_tree()
+        self.app.offer_tree.selection_set((free.key,used.key))
+        self.root.update()
+        self.app.apply_credentials(Credentials('123','UA','bc','secret'))
+        claimed = []
+        def claim(client, offer, control, history=None, emit=None):
+            claimed.append(offer.key)
+            offer.status = SUBSCRIBED
+            return f'Subscribed to @{offer.username}'
+        def local_client(auth, source, control, emit, work, proxy):
+            return work(object())
+        with patch('ofdl.ui.messagebox.askyesno', return_value=False) as ask:
+            self.app.subscribe_selected()
+        self.assertIsNone(self.app.worker)
+        ask.assert_called_once()
+        with patch('ofdl.ui.messagebox.askyesno', return_value=True), \
+                patch('ofdl.ui.messagebox.showinfo'), \
+                patch('ofdl.ui.claim_offer', side_effect=claim), \
+                patch.object(self.app, '_with_client', side_effect=local_client):
+            self.app.subscribe_selected()
+            self.finish_task()
+        self.assertEqual(claimed, [free.key])
+        self.assertIn('1 claimed', self.app.offer_status.get())
+
+    def test_offer_search_filters_by_creator_and_source(self):
+        from ofdl.offers import classify
+        a = classify({'id':2,'username':'alice','subscribePrice':0}, source='fixture')
+        b = classify({'id':3,'username':'bob','subscribePrice':0}, source='promotion')
+        self.app.offers = {a.key:a, b.key:b}
+        self.app.offer_search.set('alice')
+        self.app._refresh_offer_tree()
+        self.assertEqual(self.app.offer_tree.get_children(), (a.key,))
+        self.app.offer_search.set('promotion')
+        self.app._refresh_offer_tree()
+        self.assertEqual(self.app.offer_tree.get_children(), (b.key,))
 
     def test_auto_check_schedules_and_cancels(self):
         self.app.auto_check.set(True)

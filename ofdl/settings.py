@@ -14,7 +14,8 @@ PREFERENCE_KEYS = {'output_dir','profiles','skip_profiles','days','since','album
                    'theme','autoload_session','auto_check','auto_check_interval',
                    'scan_active','scan_expired','scan_messages','offer_names','offer_filter',
                    'offer_status_filter','duplicate_dir','proxy','scan_inbox','scan_lists',
-                   'scan_promotions'}
+                   'scan_promotions','live_enabled','live_include','live_exclude','live_interval',
+                   'live_parallel','live_folder','live_minutes','offer_search','deep_offers'}
 
 
 def config_dir() -> Path:

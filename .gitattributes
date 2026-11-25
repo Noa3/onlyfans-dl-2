@@ -1,0 +1,2 @@
+# Keep shell launchers LF-only so they run on Linux/macOS even from a Windows checkout.
+*.sh text eol=lf

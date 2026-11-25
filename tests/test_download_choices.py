@@ -403,7 +403,7 @@ class DownloadControlsTests(unittest.TestCase):
         self.app.skip_profiles.set('beta')
         self.app.output_dir.set(str(Path(self.temp.name) / 'no-output'))
         client = SubscriptionClient()
-        def local_client(auth, source, control, emit, work):
+        def local_client(auth, source, control, emit, work, proxy):
             return work(client)
         with patch.object(self.app, '_with_client', side_effect=local_client), patch('ofdl.ui.messagebox.showerror') as error:
             self.app.start_download(True)
@@ -419,7 +419,7 @@ class DownloadControlsTests(unittest.TestCase):
         self.app.skip_profiles.set('beta')
         ready = threading.Event()
         client = SubscriptionClient()
-        def local_client(auth, source, control, emit, work):
+        def local_client(auth, source, control, emit, work, proxy):
             ready.wait(1)
             return work(client)
         with patch.object(self.app, '_with_client', side_effect=local_client), patch('ofdl.ui.messagebox.showerror') as error:

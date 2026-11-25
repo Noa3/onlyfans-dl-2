@@ -1,4 +1,4 @@
-"""Free-page and free-trial offers: detection plus confirmed claim actions.
+"""Free-page and free-trial discovery plus guarded zero-price claiming.
 
 Detection follows the same price semantics the community OF-Scraper tool uses:
 
@@ -7,23 +7,25 @@ Detection follows the same price semantics the community OF-Scraper tool uses:
   page whose regular price is paid.
 
 Only data the account can already read is used (active/expired subscriptions,
-the account's own chats, publicly readable profiles). Nothing is subscribed or
-claimed without an explicit click and confirmation in the Free & trials tab.
-No paid offer is ever acted on: offers whose price is above zero are ignored.
+the account's own chats, publicly readable profiles). Claiming is limited to
+zero-price rows: free pages are re-read immediately before the POST, shared
+trial links are claimed by their code, and POSTs are never retried. A price
+change between the final check and the server's decision cannot be fully
+excluded, so callers must obtain explicit confirmation first.
 """
 from __future__ import annotations
 
 import hashlib
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 from urllib.parse import urlsplit
 
 from .api import ApiClient, ApiError
-from .common import AppError, Control, EventSink, no_events
+from .common import AppError, Cancelled, Control, EventSink, no_events
 from .settings import atomic_json, config_dir
 
 TRIAL_LINK_RE = re.compile(
@@ -39,6 +41,7 @@ LIST_PAGE_SIZE = 50
 MAX_LIST_USERS = 400
 MAX_PROMOTION_BANNERS = 25
 HISTORY_LIMIT = 2000
+_FAILED_SOURCE = object()
 
 FREE = 'free'
 TRIAL = 'trial'
@@ -49,7 +52,7 @@ USED = 'used'
 
 @dataclass
 class Offer:
-    """One free page or free trial the account may act on."""
+    """One scanned free page or trial candidate for website review."""
 
     key: str
     username: str
@@ -68,12 +71,20 @@ class Offer:
 
     @property
     def actionable(self) -> bool:
-        """False when a row is informational only (already subscribed or no code)."""
-        if self.status != AVAILABLE:
+        """Only zero-price rows with a known claim path can be sent.
+
+        Free pages use the subscribe endpoint; trials need their shared code.
+        A trial that only appears as a reduced profile price has no verified
+        claim route and stays website-only.
+        """
+        if not self.available or self.price != 0:
             return False
-        if self.kind == FREE:
-            return self.user_id.isdigit()
-        return bool(self.code)
+        return bool(self.user_id) if self.kind == FREE else bool(self.code)
+
+    @property
+    def available(self) -> bool:
+        """A scanned zero-price candidate that has not been used yet."""
+        return self.status == AVAILABLE
 
     @property
     def reason(self) -> str:
@@ -82,8 +93,8 @@ class Offer:
         if self.status == USED:
             return 'Already claimed'
         if self.kind == TRIAL and not self.code:
-            return 'Claim this trial on the website'
-        return ''
+            return 'Trial offer needs website review'
+        return 'Ready to subscribe' if self.kind == FREE else 'Ready to claim'
 
     @property
     def url(self) -> str:
@@ -158,9 +169,9 @@ def classify(row: Mapping[str, Any], *, source: str, status: str = AVAILABLE) ->
     current = _number(row.get('currentSubscribePrice'))
     if current is None:
         current = _number(subscribed_data.get('currentPrice'))
-    regular = _number(subscribed_data.get('regularPrice'))
+    regular = _number(row.get('subscribePrice'))
     if regular is None:
-        regular = _number(row.get('subscribePrice'))
+        regular = _number(subscribed_data.get('regularPrice'))
 
     if regular is None:
         return None
@@ -188,38 +199,59 @@ def classify(row: Mapping[str, Any], *, source: str, status: str = AVAILABLE) ->
                  price=0.0, regular_price=regular)
 
 
+def _source_failure(source: str, exc: AppError, emit: EventSink) -> None:
+    # Cancellation, expired authentication and rate limits stop the scan; a
+    # missing optional endpoint does not discard results from other sources.
+    if isinstance(exc, Cancelled) or (isinstance(exc, ApiError) and exc.status in {401, 429}):
+        raise exc
+    detail = f'HTTP {exc.status}' if isinstance(exc, ApiError) else str(exc)
+    message = f'{source}: incomplete source ({detail}); keeping results already found.'
+    emit('log', message)
+    emit('offer_warning', {'source': source, 'message': message})
+
+
+def _source_request(client: ApiClient, endpoint: str, params=None, *, source: str,
+                    emit: EventSink):
+    try:
+        return client.request(endpoint, params)
+    except AppError as exc:
+        _source_failure(source, exc, emit)
+        return _FAILED_SOURCE
+
+
 def _subscription_rows(client: ApiClient, control: Control, state: str,
                        emit: EventSink) -> Iterable[Mapping[str, Any]]:
     emit('log', f'Reading {state} subscriptions to look for free pages and trials.')
-    for row in client.paginate('/subscriptions/subscribes', 'subscriptions',
-                               subscription_type=state):
-        control.checkpoint()
-        if isinstance(row, dict):
-            yield row
+    try:
+        for row in client.paginate('/subscriptions/subscribes', 'subscriptions',
+                                   subscription_type=state):
+            control.checkpoint()
+            if isinstance(row, dict):
+                yield row
+    except AppError as exc:
+        _source_failure(f'{state} subscriptions', exc, emit)
 
 
 def _chat_offers(client: ApiClient, control: Control, username: str,
-                 emit: EventSink) -> Iterable[Offer]:
+                 emit: EventSink, pages: int = MESSAGE_PAGES) -> Iterable[Offer]:
     """Look at the newest messages of one chat for shared trial links."""
     cursor: str | None = None
-    for _ in range(MESSAGE_PAGES):
+    for _ in range(pages):
         control.checkpoint()
         params: dict[str, Any] = {'limit': MESSAGE_PAGE_SIZE, 'order': 'desc'}
         if cursor:
             params['id'] = cursor
         try:
             data = client.request(f'/chats/{username}/messages', params)
-        except ApiError as exc:
-            if exc.status in {401, 403, 404, 429}:
-                emit('log', f'Chat with @{username} skipped ({exc.status}).')
-                return
-            raise
+        except AppError as exc:
+            _source_failure(f'Chat with @{username}', exc, emit)
+            return
         if isinstance(data, list):
             rows, has_more = data, False
         elif isinstance(data, dict) and isinstance(data.get('list'), list):
             rows, has_more = data['list'], data.get('hasMore') is True
         else:
-            emit('log', f'Chat with @{username} has an unexpected format; skipped.')
+            _source_failure(f'Chat with @{username}', AppError('Unexpected response format'), emit)
             return
         if not rows:
             return
@@ -237,7 +269,8 @@ def _chat_offers(client: ApiClient, control: Control, username: str,
             return
 
 
-def _inbox_names(client: ApiClient, control: Control, emit: EventSink) -> list[str]:
+def _inbox_names(client: ApiClient, control: Control, emit: EventSink,
+                 max_pages: int = MAX_CHAT_PAGES) -> list[str]:
     """Recent chat partners from the inbox, newest first.
 
     Only tiny identifiers are read; no message text is touched here.
@@ -245,12 +278,17 @@ def _inbox_names(client: ApiClient, control: Control, emit: EventSink) -> list[s
     names: list[str] = []
     seen: set[str] = set()
     offset = 0
-    for _ in range(MAX_CHAT_PAGES):
+    for _ in range(max_pages):
         control.checkpoint()
-        data = client.request('/chats', {'limit': MESSAGE_PAGE_SIZE, 'offset': offset,
-                                         'order': 'recent'})
+        data = _source_request(client, '/chats', {'limit': MESSAGE_PAGE_SIZE, 'offset': offset,
+                                                'order': 'recent'}, source='Inbox', emit=emit)
+        if data is _FAILED_SOURCE:
+            break
         rows = data.get('list') if isinstance(data, dict) else data
-        if not isinstance(rows, list) or not rows:
+        if not isinstance(rows, list):
+            _source_failure('Inbox', AppError('Unexpected response format'), emit)
+            break
+        if not rows:
             break
         for row in rows:
             if not isinstance(row, dict):
@@ -273,15 +311,23 @@ def _inbox_names(client: ApiClient, control: Control, emit: EventSink) -> list[s
     return names
 
 
-def _list_rows(client: ApiClient, control: Control, emit: EventSink) -> list[dict[str, Any]]:
+def _list_rows(client: ApiClient, control: Control, emit: EventSink,
+               max_lists: int = MAX_LISTS,
+               max_users: int = MAX_LIST_USERS) -> Iterable[dict[str, Any]]:
     """Users from the account's own custom lists (favorites and similar)."""
     list_ids: list[str] = []
     offset = 0
     for _ in range(4):
         control.checkpoint()
-        data = client.request('/lists', {'limit': LIST_PAGE_SIZE, 'offset': offset})
+        data = _source_request(client, '/lists', {'limit': LIST_PAGE_SIZE, 'offset': offset},
+                               source='Custom lists', emit=emit)
+        if data is _FAILED_SOURCE:
+            break
         rows = data.get('list') if isinstance(data, dict) else data
-        if not isinstance(rows, list) or not rows:
+        if not isinstance(rows, list):
+            _source_failure('Custom lists', AppError('Unexpected response format'), emit)
+            break
+        if not rows:
             break
         for row in rows:
             if not isinstance(row, dict):
@@ -290,23 +336,29 @@ def _list_rows(client: ApiClient, control: Control, emit: EventSink) -> list[dic
             if list_id.isdigit() and list_id not in list_ids:
                 list_ids.append(list_id)
         has_more = data.get('hasMore') if isinstance(data, dict) else None
-        if has_more is False or len(list_ids) >= MAX_LISTS:
+        if has_more is False or len(list_ids) >= max_lists:
             break
         offset += len(rows)
         if has_more is None and len(rows) < LIST_PAGE_SIZE:
             break
-    list_ids = list_ids[:MAX_LISTS]
+    list_ids = list_ids[:max_lists]
     emit('offer_progress', {'phase': 'lists', 'done': 0, 'total': len(list_ids)})
-    users: list[dict[str, Any]] = []
     seen: set[str] = set()
     for number, list_id in enumerate(list_ids, start=1):
         control.checkpoint()
         offset = 0
         for _ in range(8):
-            data = client.request(f'/lists/{list_id}/users',
-                                  {'limit': LIST_PAGE_SIZE, 'offset': offset})
+            control.checkpoint()
+            data = _source_request(client, f'/lists/{list_id}/users',
+                                   {'limit': LIST_PAGE_SIZE, 'offset': offset},
+                                   source=f'Custom list {list_id}', emit=emit)
+            if data is _FAILED_SOURCE:
+                break
             rows = data.get('list') if isinstance(data, dict) else data
-            if not isinstance(rows, list) or not rows:
+            if not isinstance(rows, list):
+                _source_failure(f'Custom list {list_id}', AppError('Unexpected response format'), emit)
+                break
+            if not rows:
                 break
             for row in rows:
                 if not isinstance(row, dict):
@@ -314,11 +366,11 @@ def _list_rows(client: ApiClient, control: Control, emit: EventSink) -> list[dic
                 name = _username(row.get('username'))
                 if name and name not in seen:
                     seen.add(name)
-                    users.append(row)
-                    if len(users) >= MAX_LIST_USERS:
+                    yield row
+                    if len(seen) >= max_users:
                         emit('offer_progress', {'phase': 'lists', 'done': number,
                                                 'total': len(list_ids)})
-                        return users
+                        return
             has_more = data.get('hasMore') if isinstance(data, dict) else None
             if has_more is False:
                 break
@@ -326,23 +378,23 @@ def _list_rows(client: ApiClient, control: Control, emit: EventSink) -> list[dic
             if has_more is None and len(rows) < LIST_PAGE_SIZE:
                 break
         emit('offer_progress', {'phase': 'lists', 'done': number, 'total': len(list_ids)})
-    return users
 
 
-def _promotion_offers(client: ApiClient, control: Control, emit: EventSink) -> list[Offer]:
+def _promotion_offers(client: ApiClient, control: Control, emit: EventSink) -> Iterable[Offer]:
     """Banners the website shows to this account under "promotions".
 
     Only the URL of each banner is followed: a shared trial link is used
     directly, a creator profile is classified like any other profile. Banner
     images and other creative content are not downloaded.
     """
-    data = client.request('/users/promotions')
+    data = _source_request(client, '/users/promotions', source='Website promotions', emit=emit)
+    if data is _FAILED_SOURCE:
+        return
     rows = data.get('list') if isinstance(data, dict) and isinstance(data.get('list'), list) else data
     if not isinstance(rows, list):
-        emit('log', 'Website promotions have an unexpected format; skipped.')
-        return []
+        _source_failure('Website promotions', AppError('Unexpected response format'), emit)
+        return
     emit('log', f'Website promotions: {len(rows)} banner(s) available.')
-    result: list[Offer] = []
     profiles: list[str] = []
     ignored = 0
     for row in rows[:MAX_PROMOTION_BANNERS]:
@@ -353,10 +405,9 @@ def _promotion_offers(client: ApiClient, control: Control, emit: EventSink) -> l
         links = trial_links(url)
         if links:
             for name, code in links:
-                result.append(Offer(key=f'trialcode:{OfferHistory.code_token(code)}',
-                                    username=name, kind=TRIAL, source='website promotion',
-                                    code=code,
-                                    detail='Free trial link from a website promotion'))
+                yield Offer(key=f'trialcode:{OfferHistory.code_token(code)}',
+                            username=name, kind=TRIAL, source='website promotion', code=code,
+                            detail='Free trial link from a website promotion')
             continue
         try:
             parsed = urlsplit(url)
@@ -378,46 +429,61 @@ def _promotion_offers(client: ApiClient, control: Control, emit: EventSink) -> l
         control.checkpoint()
         try:
             profile = client.user(name)
-        except ApiError as exc:
-            emit('log', f'Promotion profile @{name} skipped ({exc.status}).')
+        except AppError as exc:
+            _source_failure(f'Promotion profile @{name}', exc, emit)
             ignored += 1
             continue
         offer = classify(profile, source='website promotion',
                          status=SUBSCRIBED if profile.get('subscribedBy') is True else AVAILABLE)
         if offer is not None:
-            result.append(offer)
+            yield offer
         else:
             ignored += 1
         emit('offer_progress', {'phase': 'promotions', 'done': index, 'total': len(profiles)})
     if ignored:
         emit('log', f'Website promotions: {ignored} banner(s) ignored because they are paid, '
                     f'unreadable or not zero-price. Paid offers are never listed or claimed.')
-    return result
 
 
 def scan_offers(client: ApiClient, control: Control, *, include_active: bool = True,
                 include_expired: bool = True, include_messages: bool = True,
                 include_inbox: bool = True, include_lists: bool = True,
-                include_promotions: bool = True,
+                include_promotions: bool = True, deep: bool = False,
                 extra_profiles: Iterable[str] = (), history: OfferHistory | None = None,
                 emit: EventSink = no_events) -> list[Offer]:
     """Build the current free/trial list for the signed-in account.
 
     Active subscriptions are included so already-subscribed pages appear as
     read-only rows; they can never be subscribed again from this tab.
+
+    ``deep`` raises the bounded chat/list limits. It is still an
+    account-connected scan, never a platform-wide directory.
     """
     history = history or OfferHistory.load()
+    pages = 10 if deep else MESSAGE_PAGES
+    max_chats = 400 if deep else MAX_CHATS
+    max_inbox_profiles = 250 if deep else MAX_INBOX_PROFILES
+    max_lists = 60 if deep else MAX_LISTS
+    max_list_users = 2000 if deep else MAX_LIST_USERS
+    max_inbox_pages = 20 if deep else MAX_CHAT_PAGES
+    if deep:        emit('log', 'Deep scan enabled: more chat pages, chat partners, custom lists and list users.')
     offers: dict[str, Offer] = {}
     chat_names: list[str] = []
     subscribed_names: set[str] = set()
 
+    def publish(offer: Offer, removed: str | None = None) -> None:
+        # Queue a snapshot: later de-duplication must not mutate a UI event
+        # that is still waiting to be consumed on the Tk thread.
+        emit('offer_row', {'offer': replace(offer), 'remove': removed})
+
     def add(offer: Offer | None) -> None:
         if offer is None:
             return
-        if offer.kind == TRIAL and offer.code and history.is_claimed(offer.code):
-            offer.status = USED
-        if offer.kind == FREE and offer.user_id and history.is_subscribed(offer.user_id):
+        if offer.username.casefold() in subscribed_names:
             offer.status = SUBSCRIBED
+        if offer.kind == TRIAL and offer.code and history.is_claimed(offer.code):
+            if offer.status != SUBSCRIBED:
+                offer.status = USED
         previous = offers.get(offer.key)
         if previous is not None:
             # Active subscription state always wins over a chat/profile sighting.
@@ -425,6 +491,7 @@ def scan_offers(client: ApiClient, control: Control, *, include_active: bool = T
                 return
             if offer.status == SUBSCRIBED:
                 offers[offer.key] = offer
+                publish(offer)
             return
         # One row per creator: a free page and a trial link for the same account
         # would be the same subscription attempt twice.
@@ -435,13 +502,17 @@ def scan_offers(client: ApiClient, control: Control, *, include_active: bool = T
                 return
             if offer.status == SUBSCRIBED:
                 same_creator.status = SUBSCRIBED
+                publish(same_creator)
                 return
-            if offer.actionable and not same_creator.actionable:
-                # Prefer the row that can actually be claimed (a shared code).
+            if (offer.available and not same_creator.available or
+                    offer.available and same_creator.available and offer.code and not same_creator.code):
+                # Prefer an unused shared link over a code-less/used trial.
                 offers.pop(same_creator.key, None)
                 offers[offer.key] = offer
+                publish(offer, same_creator.key)
             return
         offers[offer.key] = offer
+        publish(offer)
 
     client.user('me')
     states: list[str] = []
@@ -450,75 +521,81 @@ def scan_offers(client: ApiClient, control: Control, *, include_active: bool = T
     if include_expired:
         states.append('expired')
     for number,state in enumerate(states, start=1):
+        emit('offer_progress', {'phase': 'subscriptions', 'done': number - 1, 'total': len(states)})
         for row in _subscription_rows(client, control, state, emit):
             name = _username(row.get('username'))
             active = state == 'active' or row.get('subscribedBy') is True
-            if active and name:
-                subscribed_names.add(name)
+            if name and active:
+                subscribed_names.add(name.casefold())
+                chat_names.append(name)
+            elif name and include_messages:
+                # Expired creators can share a fresh trial link in a new chat
+                # message even though the paid subscription has ended.
                 chat_names.append(name)
             add(classify(row, source=f'{state} subscription',
                          status=SUBSCRIBED if active else AVAILABLE))
         emit('offer_progress', {'phase': 'subscriptions', 'done': number, 'total': len(states)})
 
     if include_inbox:
-        inbox = _inbox_names(client, control, emit)
+        emit('offer_progress', {'phase': 'inbox', 'done': 0})
+        inbox = _inbox_names(client, control, emit, max_pages=max_inbox_pages)
         emit('log', f'Inbox: {len(inbox)} recent chat partner(s) found.')
         known = {offer.username.casefold() for offer in offers.values()}
-        chat_names.extend(name for name in inbox if name not in subscribed_names)
+        chat_names.extend(name for name in inbox if name.casefold() not in subscribed_names)
         candidates = [name for name in inbox if name.casefold() not in known]
-        if len(candidates) > MAX_INBOX_PROFILES:
-            emit('log', f'Checking the first {MAX_INBOX_PROFILES} of {len(candidates)} inbox '
+        if len(candidates) > max_inbox_profiles:
+            emit('log', f'Checking the first {max_inbox_profiles} of {len(candidates)} inbox '
                         f'profiles; the rest are covered by the message scan only.')
-            candidates = candidates[:MAX_INBOX_PROFILES]
+            candidates = candidates[:max_inbox_profiles]
         for index, name in enumerate(candidates, start=1):
             control.checkpoint()
             try:
                 profile = client.user(name)
-            except ApiError as exc:
-                if exc.status in {401, 429}:
-                    raise
-                emit('log', f'Inbox profile @{name} skipped ({exc.status}).')
+            except AppError as exc:
+                _source_failure(f'Inbox profile @{name}', exc, emit)
                 continue
             add(classify(profile, source='inbox chat partner',
                          status=SUBSCRIBED if profile.get('subscribedBy') is True else AVAILABLE))
             emit('offer_progress', {'phase': 'profiles', 'done': index, 'total': len(candidates)})
 
     if include_lists:
-        list_rows = _list_rows(client, control, emit)
-        emit('log', f'Custom lists: {len(list_rows)} creator(s) found.')
-        for row in list_rows:
+        emit('offer_progress', {'phase': 'lists', 'done': 0})
+        for row in _list_rows(client, control, emit, max_lists=max_lists,
+                              max_users=max_list_users):
             add(classify(row, source='custom list',
                          status=SUBSCRIBED if row.get('subscribedBy') is True else AVAILABLE))
 
     if include_promotions:
+        emit('offer_progress', {'phase': 'promotions', 'done': 0})
         for offer in _promotion_offers(client, control, emit):
             add(offer)
 
     if include_messages and chat_names:
         names = list(dict.fromkeys(chat_names))
-        if len(names) > MAX_CHATS:
-            emit('log', f'Checking the newest messages of the first {MAX_CHATS} of {len(names)} chats; '
+        if len(names) > max_chats:
+            emit('log', f'Checking the newest messages of the first {max_chats} of {len(names)} chats; '
                         f'the rest are skipped to keep the scan bounded.')
-            names = names[:MAX_CHATS]
+            names = names[:max_chats]
         else:
             emit('log', f'Checking the newest messages of {len(names)} chat(s) for trial links.')
         for index, name in enumerate(names, start=1):
-            for offer in _chat_offers(client, control, name, emit):
-                if offer.username in subscribed_names:
+            for offer in _chat_offers(client, control, name, emit, pages=pages):
+                if offer.username.casefold() in subscribed_names:
                     offer.status = SUBSCRIBED
                 add(offer)
             emit('offer_progress', {'phase': 'messages', 'done': index, 'total': len(names)})
 
     extra_profiles = list(extra_profiles)
     for index, name in enumerate(extra_profiles, start=1):
+        control.checkpoint()
         clean = _username(name)
         if not clean:
             emit('log', 'Ignored an invalid creator name in the check list.')
             continue
         try:
             profile = client.user(clean)
-        except ApiError as exc:
-            emit('log', f'Profile @{clean} could not be read ({exc.status}); skipped.')
+        except AppError as exc:
+            _source_failure(f'Profile @{clean}', exc, emit)
             continue
         add(classify(profile, source='checked profile',
                      status=SUBSCRIBED if profile.get('subscribedBy') is True else AVAILABLE))
@@ -532,28 +609,63 @@ def scan_offers(client: ApiClient, control: Control, *, include_active: bool = T
 
 def claim_offer(client: ApiClient, offer: Offer, control: Control,
                 history: OfferHistory | None = None, emit: EventSink = no_events) -> str:
-    """Act on one offer after the user confirmed it. Returns a safe message."""
-    if offer.status != AVAILABLE:
-        raise AppError(f'@{offer.username} is already {offer.reason.lower()}. Nothing was sent.')
-    if offer.kind == FREE:
-        if not offer.user_id.isdigit():
-            raise AppError('This free page has no usable account ID. Rescan and try again.')
-        control.checkpoint()
-        client.post(f'/users/{offer.user_id}/subscribe', {})
-        offer.status = SUBSCRIBED
-        (history or OfferHistory.load()).mark_subscribed(offer.user_id, offer.username, FREE)
-        emit('log', f'Subscribed to free page @{offer.username}.')
-        return f'Subscribed to @{offer.username} (free page).'
-    if offer.kind != TRIAL:
-        raise AppError('Unsupported offer type.')
-    if not offer.code:
-        raise AppError('This trial has no claimable code. Open it on the website instead.')
+    """Subscribe a free page or claim a shared trial code.
+
+    Safety rules, enforced for every caller:
+
+    * only a row whose scanned price is exactly 0 is sent;
+    * free pages are re-read immediately before the POST and are refused if
+      they are no longer free or already subscribed;
+    * trials need a shared code; a code-less reduced-price trial has no
+      verified claim route and is refused;
+    * POSTs are never retried (the API client already enforces this).
+
+    A price change between the final read and the server's decision cannot be
+    excluded. The UI therefore asks for explicit confirmation and warns that a
+    trial auto-renews at the creator's regular price unless cancelled.
+    """
     control.checkpoint()
-    client.post('/trials/claim', {'code': offer.code})
-    offer.status = USED
-    (history or OfferHistory.load()).mark_claimed(offer.code, offer.username)
-    emit('log', f'Free trial claimed for @{offer.username}.')
-    return f'Free trial claimed for @{offer.username}.'
+    history = history or OfferHistory.load()
+    if not offer.actionable:
+        raise AppError(f'@{offer.username} is not a zero-price claimable offer. Nothing was sent.')
+    name = _username(offer.username)
+    if not name:
+        raise AppError('The offer has no valid creator name. Nothing was sent.')
+    # Verify the creator again: it also supplies the numeric ID and catches a
+    # subscription that happened after the scan.
+    try:
+        profile = client.user(name)
+    except ApiError as exc:
+        if exc.status in {401, 429}:
+            raise
+        raise AppError(f'Could not verify @{name} before sending. Nothing was sent.') from None
+    if profile.get('subscribedBy') is True:
+        offer.status = SUBSCRIBED
+        raise AppError(f'@{name} is already subscribed. Nothing was sent.')
+    user_id = str(profile.get('id', ''))
+    if not user_id.isdigit():
+        raise AppError(f'@{name} did not return a valid account ID. Nothing was sent.')
+    control.checkpoint()
+    if offer.kind == TRIAL:
+        if not offer.code:
+            raise AppError('This trial has no claim code; open it on the website. Nothing was sent.')
+        if history.is_claimed(offer.code):
+            offer.status = USED
+            raise AppError(f'That trial code for @{name} was already claimed. Nothing was sent.')
+        client.post('/trials/claim', {'code': offer.code})
+        history.mark_claimed(offer.code, name)
+        history.mark_subscribed(user_id, name, TRIAL)
+        offer.status = SUBSCRIBED
+        emit('log', f'Free trial claimed for @{name}.')
+        return f'Free trial claimed for @{name}'
+    fresh = classify(profile, source='claim check')
+    if fresh is None or fresh.kind != FREE or fresh.price != 0 or fresh.regular_price != 0:
+        raise AppError(f'@{name} is no longer a zero-price page. Nothing was sent.')
+    client.post(f'/users/{fresh.user_id}/subscribe')
+    history.mark_subscribed(fresh.user_id, name, FREE)
+    offer.status = SUBSCRIBED
+    emit('log', f'Subscribed to free page @{name}.')
+    return f'Subscribed to @{name}'
 
 
 class OfferHistory:

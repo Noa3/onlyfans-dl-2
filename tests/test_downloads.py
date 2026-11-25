@@ -246,6 +246,35 @@ class DownloadTests(unittest.TestCase):
         self.assertEqual(values['drm'],0)
         self.assertIn('drm',values)
 
+    def test_streaming_extensions_do_not_imply_drm(self):
+        for suffix in ('mpd','m3u8'):
+            with self.subTest(suffix=suffix):
+                post = self.post()
+                media = post['media'][0]
+                media['type'] = 'video'
+                media['files']['full']['url'] = f'https://cdn2.onlyfans.com/a.{suffix}'
+                task, reason = media_task(post,media,'42','creator','posts',self.options)
+                self.assertIsNone(task)
+                self.assertEqual(reason,'streaming')
+                media['isDrm'] = True
+                self.assertEqual(media_task(post,media,'42','creator','posts',self.options)[1], 'drm')
+
+    def test_scan_counts_streaming_drm_and_accessible_purchases_separately(self):
+        post = self.post(fromUser={'id':42,'username':'creator'})
+        post['media'].extend([
+            {'id':124,'type':'video','files':{'full':{'url':'https://cdn2.onlyfans.com/a.m3u8'}}},
+            {'id':125,'type':'video','isDrm':True},
+        ])
+        class Client:
+            auth = Credentials('123','UA','bc','session')
+            def user(self, name):
+                return {'id':42,'username':name}
+            def paginate(self, endpoint, kind, **kwargs):
+                return iter([post] if kind == 'purchased' else [])
+        options = Options(output_dir=self.root,profiles=['creator'],categories=('purchased',),dry_run=True)
+        summary = run_downloads(Client(),options,Control())
+        self.assertEqual((summary.planned, summary.streaming, summary.drm, summary.unavailable), (1,1,1,0))
+
     def test_preview_is_opt_in_and_distinct_from_full(self):
         post = self.post()
         post['media'][0]['files'] = {'full':{'url':None},'preview':{'url':'https://cdn2.onlyfans.com/preview.jpg'}}

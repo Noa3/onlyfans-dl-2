@@ -5,6 +5,7 @@ import json
 import os
 import re
 import sqlite3
+import threading
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -18,6 +19,7 @@ from .api import ApiClient, ApiError, TIMEOUT, wait_retry
 from .common import AppError, Cancelled, Control, EventSink, no_events
 from .http import normalize_proxy, proxy_mapping
 from .settings import atomic_json
+from .pipeline import BoundedWorker
 
 CATEGORIES = ('posts','archived','stories','messages','purchased')
 MEDIA_EXTENSIONS = {'.jpg','.jpeg','.png','.gif','.webp','.avif','.heic','.heif',
@@ -193,7 +195,7 @@ def media_task(post: dict[str,Any], media: dict[str,Any], owner_id: str, profile
     if not isinstance(url,str) or not url:
         return None,'unavailable'
     if Path(urlsplit(url).path).suffix.lower() in {'.mpd','.m3u8'}:
-        return None,'drm'
+        return None,'streaming'
     validate_media_url(url)
     media_id = str(media.get('id',''))
     if not re.fullmatch(r'[0-9]{1,24}',media_id):
@@ -407,6 +409,7 @@ class RunSummary:
     filtered: int = 0
     unavailable: int = 0
     drm: int = 0
+    streaming: int = 0
     errors: int = 0
     transferred_bytes: int = 0
 
@@ -675,7 +678,10 @@ def run_downloads(client: ApiClient, options: Options, control: Control,
                   emit: EventSink = no_events) -> RunSummary:
     options.validate()
     summary = RunSummary()
-    queue: dict[str,MediaTask] = {}
+    seen: set[str] = set()
+    state_lock = threading.RLock()
+    scanning = True
+    completed = 0
     owners: dict[str,str] = {}
     emit('pipeline',{'stage':'scan'})
     emit('phase','Scanning accessible content')
@@ -684,9 +690,57 @@ def run_downloads(client: ApiClient, options: Options, control: Control,
     profiles = resolve_creator_profiles(client, options, control, emit)
     emit('phase', 'Scanning accessible content')
 
+    def update(**changes: int) -> None:
+        with state_lock:
+            for name, amount in changes.items():
+                setattr(summary, name, getattr(summary, name) + amount)
+            emit('stats', summary.to_dict())
+
+    def progress() -> None:
+        # Serialize snapshots from both threads so UI counters never go backwards.
+        with state_lock:
+            emit('overall', {'done': completed, 'total': summary.planned, 'scanning': scanning})
+
+    def consume(tasks) -> None:
+        nonlocal completed
+        # HTTP session, SQLite connection and folder lock belong to this thread.
+        with FolderLock(options.output_dir):
+            manifest = Manifest(options.output_dir)
+            try:
+                worker = Downloader(options,client.auth.user_agent,control,manifest,emit=emit,
+                                    proxy=getattr(client,'proxy',''))
+                try:
+                    for task in tasks:
+                        try:
+                            result,size = worker.download(task)
+                            if result == 'downloaded':
+                                update(downloaded=1, transferred_bytes=size)
+                            else:
+                                update(existing=1)
+                        except Cancelled:
+                            raise
+                        except ApiError as exc:
+                            if exc.status == 429:
+                                raise
+                            update(errors=1)
+                            emit('log',f'Failed media {task.media_id}: {exc}')
+                        except (AppError,OSError) as exc:
+                            update(errors=1)
+                            detail = str(exc) if isinstance(exc,AppError) else 'Local file operation failed; check disk space and permissions.'
+                            emit('log',f'Failed media {task.media_id}: {detail}')
+                        with state_lock:
+                            completed += 1
+                            progress()
+                finally:
+                    worker.close()
+            finally:
+                manifest.close()
+
+    pipeline = BoundedWorker(control, consume)
+
     def accept(post: dict[str,Any], uid: str, name: str, category: str) -> None:
         if not isinstance(post,dict):
-            summary.errors += 1
+            update(errors=1)
             return
         media_items = post.get('media',[])
         if not isinstance(media_items,list):
@@ -696,22 +750,31 @@ def run_downloads(client: ApiClient, options: Options, control: Control,
             try:
                 task,reason = media_task(post,media,uid,name,category,options)
             except AppError as exc:
-                summary.errors += 1
+                update(errors=1)
                 emit('log',f'{name}/{category}: {exc}')
                 continue
             if task:
-                if task.identity in queue:
-                    summary.duplicates += 1
+                if task.identity in seen:
+                    update(duplicates=1)
                 else:
-                    queue[task.identity] = task
-                    summary.planned += 1
+                    seen.add(task.identity)
+                    update(planned=1)
+                    if options.dry_run:
+                        emit('log',f'Planned: {task.relative_path(options)}')
+                    else:
+                        if pipeline.thread is None:
+                            emit('pipeline',{'stage':'streaming'})
+                            emit('phase','Scanning and downloading accessible media')
+                        pipeline.submit(task)
+                        progress()
             elif reason == 'filtered':
-                summary.filtered += 1
+                update(filtered=1)
             elif reason == 'drm':
-                summary.drm += 1
+                update(drm=1)
+            elif reason == 'streaming':
+                update(streaming=1)
             else:
-                summary.unavailable += 1
-        emit('stats',summary.to_dict())
+                update(unavailable=1)
 
     def enumerate_category(uid: str, name: str, category: str, endpoint: str) -> None:
         try:
@@ -720,109 +783,75 @@ def run_downloads(client: ApiClient, options: Options, control: Control,
         except ApiError as exc:
             if exc.status in {401,429}:
                 raise
-            summary.errors += 1
+            update(errors=1)
             emit('log',f'Incomplete scan for {name}/{category}: {exc}')
         except Cancelled:
             raise
         except AppError as exc:
-            summary.errors += 1
+            update(errors=1)
             emit('log',f'Incomplete scan for {name}/{category}: {exc}')
 
-    for name in profiles:
-        control.checkpoint()
-        emit('log',f'Looking up {name}.')
-        try:
-            user = client.user(name)
-        except ApiError as exc:
-            if exc.status in {401,429}:
-                raise
-            summary.errors += 1
-            emit('log',f'Skipping {name}: {exc}')
-            continue
-        uid = str(user['id'])
-        if not re.fullmatch(r'[0-9]{1,24}',uid):
-            summary.errors += 1
-            emit('log',f'Skipping {name}: invalid account ID in profile response.')
-            continue
-        if uid in owners:
-            continue
-        owners[uid] = name
-        routes = {'posts':f'/users/{uid}/posts','archived':f'/users/{uid}/posts/archived',
-                  'stories':f'/users/{uid}/stories','messages':f'/chats/{uid}/messages'}
-        for category in options.categories:
-            if category != 'purchased':
-                enumerate_category(uid,name,category,routes[category])
-    if 'purchased' in options.categories and owners:
-        emit('log','Scanning purchases once for all selected profiles.')
-        try:
-            for post in client.paginate('/posts/paid/all','purchased'):
-                author = post.get('fromUser') or post.get('author') or {}
-                if not isinstance(author,dict):
-                    continue
-                uid = str(author.get('id',''))
-                name = owners.get(uid)
-                if name is None:
-                    author_name = str(author.get('username','')).lower()
-                    for owner_id, profile in owners.items():
-                        if author_name == profile:
-                            uid,name = owner_id,profile
-                            break
-                if name:
-                    accept(post,uid,name,'purchased')
-        except ApiError as exc:
-            if exc.status in {401,429}:
-                raise
-            summary.errors += 1
-            emit('log',f'Incomplete purchased-content scan: {exc}')
-        except Cancelled:
-            raise
-        except AppError as exc:
-            summary.errors += 1
-            emit('log',f'Incomplete purchased-content scan: {exc}')
-    emit('stats',summary.to_dict())
-    if options.dry_run:
-        emit('phase','Scan finished; no media downloaded')
-        for task in queue.values():
-            emit('log',f'Planned: {task.relative_path(options)}')
-        emit('pipeline',{'stage':'done'})
-        return summary
-    if not queue:
-        emit('phase','No downloadable media found')
-        emit('pipeline',{'stage':'done'})
-        return summary
-    control.checkpoint()
-    emit('phase','Downloading')
-    emit('pipeline',{'stage':'download','total':len(queue)})
-    with FolderLock(options.output_dir):
-        manifest = Manifest(options.output_dir)
-        worker = Downloader(options,client.auth.user_agent,control,manifest,emit=emit,
-                            proxy=getattr(client,'proxy',''))
-        try:
-            for index,task in enumerate(queue.values(),start=1):
-                control.checkpoint()
-                try:
-                    result,size = worker.download(task)
-                    if result == 'downloaded':
-                        summary.downloaded += 1
-                        summary.transferred_bytes += size
-                    else:
-                        summary.existing += 1
-                except Cancelled:
+    with pipeline:
+        for name in profiles:
+            control.checkpoint()
+            emit('log',f'Looking up {name}.')
+            try:
+                user = client.user(name)
+            except ApiError as exc:
+                if exc.status in {401,429}:
                     raise
-                except ApiError as exc:
-                    if exc.status == 429:
-                        raise
-                    summary.errors += 1
-                    emit('log',f'Failed media {task.media_id}: {exc}')
-                except (AppError,OSError) as exc:
-                    summary.errors += 1
-                    detail = str(exc) if isinstance(exc,AppError) else 'Local file operation failed; check disk space and permissions.'
-                    emit('log',f'Failed media {task.media_id}: {detail}')
-                emit('overall',{'done':index,'total':len(queue)})
-                emit('stats',summary.to_dict())
-        finally:
-            worker.close()
-            manifest.close()
-    emit('phase','Finished with issues' if summary.errors else 'Finished')
+                update(errors=1)
+                emit('log',f'Skipping {name}: {exc}')
+                continue
+            uid = str(user['id'])
+            if not re.fullmatch(r'[0-9]{1,24}',uid):
+                update(errors=1)
+                emit('log',f'Skipping {name}: invalid account ID in profile response.')
+                continue
+            if uid in owners:
+                continue
+            owners[uid] = name
+            routes = {'posts':f'/users/{uid}/posts','archived':f'/users/{uid}/posts/archived',
+                      'stories':f'/users/{uid}/stories','messages':f'/chats/{uid}/messages'}
+            for category in options.categories:
+                if category != 'purchased':
+                    enumerate_category(uid,name,category,routes[category])
+        if 'purchased' in options.categories and owners:
+            emit('log','Scanning purchases once for all selected profiles.')
+            try:
+                for post in client.paginate('/posts/paid/all','purchased'):
+                    author = post.get('fromUser') or post.get('author') or {}
+                    if not isinstance(author,dict):
+                        continue
+                    uid = str(author.get('id',''))
+                    name = owners.get(uid)
+                    if name is None:
+                        author_name = str(author.get('username','')).lower()
+                        for owner_id, profile in owners.items():
+                            if author_name == profile:
+                                uid,name = owner_id,profile
+                                break
+                    if name:
+                        accept(post,uid,name,'purchased')
+            except ApiError as exc:
+                if exc.status in {401,429}:
+                    raise
+                update(errors=1)
+                emit('log',f'Incomplete purchased-content scan: {exc}')
+            except Cancelled:
+                raise
+            except AppError as exc:
+                update(errors=1)
+                emit('log',f'Incomplete purchased-content scan: {exc}')
+        control.checkpoint()
+        with state_lock:
+            scanning = False
+            if not options.dry_run:
+                emit('pipeline',{'stage':'download','total':summary.planned})
+                progress()
+        # Context exit drains queued media and joins the worker before returning.
+    update()
+    emit('phase', 'Scan finished; no media downloaded' if options.dry_run else
+         ('Finished with issues' if summary.errors else 'Finished'))
     emit('pipeline',{'stage':'done'})
     return summary

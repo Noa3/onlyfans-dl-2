@@ -28,6 +28,9 @@ from .offers import (AVAILABLE, FREE, Offer, OfferHistory, claim_offer, scan_off
                      SUBSCRIBED, TRIAL)
 from .preview import PreviewResult, build_preview
 from .settings import DEFAULT_RULES_SOURCE, config_dir, load_preferences, save_preferences
+from .ui_duplicates import DuplicatesTab
+from .ui_offers import OffersTab
+from .ui_live import LiveTab
 
 HELP_TEXT = """QUICK START
 
@@ -70,7 +73,7 @@ SIGNING RULES AND ACCESS
 
 This is an unofficial client based on the supplied script. Signing rules and endpoint behavior can change. Refresh rules after a signature-related rejection, check the system clock, and re-import a current session. A schema-valid rules file is not proof that the platform still accepts it. The default source is community-maintained; you may choose a different trusted HTTPS JSON URL or a local file. Its server sees an ordinary connection/IP address, but not your account session.
 
-Locked media, DRM-marked media, DASH/HLS manifests, purchases you do not own, and unsupported external media hosts are skipped. There is no DRM decryption, paywall bypass, purchase automation, or access-control bypass. Use only your own account and content you are entitled and permitted to save.
+Normal Downloads skip locked media, DRM-marked media, DASH/HLS manifests, purchases you do not own, and unsupported external media hosts. The Live recording tab supports clear muxed HLS separately. There is no DRM decryption, paywall bypass, purchase automation, or access-control bypass. Use only your own account and content you are entitled and permitted to save.
 
 FILES AND PROGRESS
 
@@ -82,7 +85,47 @@ Activity shows the newest newly completed media on the right. Image/GIF thumbnai
 
 Optional automatic checks on the Downloads tab re-run a download every chosen number of minutes, but only while this window stays open; they never register an OS autostart and skip silently when the session or options are not ready.
 
-Scan only makes account/API requests, but no media downloads or output-folder writes. It lists candidate files before existing-file checks, so its planned count is not a count of new downloads. Stop/pause are cooperative; an in-flight network operation may need to finish or hit its timeout first. Discovery happens before downloading, so the overall file total is unknown during the scan.
+Scan only makes account/API requests, but no media downloads or output-folder writes. It lists candidate files before existing-file checks, so its planned count is not a count of new downloads. Start download resolves creator selection, then downloads discovered media while API paging continues through a queue of at most 64 pending items. Counters show files found so far; final percentages and ETA become available after discovery. Stop/pause apply to both workers and are cooperative; an in-flight network operation may need to finish or hit its timeout first. Files completed before a later scan error remain saved.
+
+LIVE RECORDING
+
+Automatic: load Session, open Live recording, use Set up browser if needed, choose
+an output folder and enable Automatically record live streams. Current subscriptions
+are checked every 60 seconds by default. Include/skip filters and 1–4 parallel
+recordings are configurable. A temporary browser opens accessible live WebRTC players
+and records audio/video as WebM without copied URLs. Browser verification/login may
+need attention. Polling/startup adds latency; stream beginnings can be missed.
+
+The opt-in is remembered and resumes once a session is loaded while the app is open.
+Stop selected suppresses that stream ID for this monitoring session. Stop monitoring
+and save all disables automation; closing the app retains the opt-in. Failed captures
+retry at most three times. Session/settings changes stop recordings before restarting
+monitoring. Completed IDs are deduplicated in memory only; restarting can create a
+new file for the same event. Partial files survive failures. VIDEO ONLY means no
+audio track was found. Two successful offline scans or a video stall stop capture.
+
+Browser cookies are scoped to the website in a temporary context; no persistent
+browser profile is saved by this app. Account writes are blocked except the exact
+empty viewing heartbeat. Purchase, tip, subscribe and join POSTs remain blocked;
+some players may therefore fail to start. Real-account live behavior is unverified.
+
+Manual HLS: copy an accessible HTTPS .m3u8 request URL from the browser Network tab
+into Manual HLS URL, choose a folder/label and optional maximum minutes, then Start.
+URLs stay in memory. This mode uses the Session proxy and user agent captured at
+Start; no account cookies/signing headers are sent to media hosts.
+
+The recorder runs independently alongside Downloads. Its own Stop and save button
+finishes complete segments; the footer Stop/Pause buttons only control Downloads.
+Closing the application stops both and waits for cleanup. Live streams cannot pause.
+
+Clear muxed HLS from OnlyFans/CDN HTTPS hosts is supported as MPEG-TS (.ts) or
+fragmented MP4 (.mp4). The highest-bandwidth compatible master rendition is selected;
+live capture joins near the live edge. Encryption/DRM, separate audio renditions,
+byte ranges and DASH are unsupported. Gaps, restarts, changed initialization,
+discontinuities and two minutes without new segments stop capture and keep .part
+files. Expired URLs require a fresh URL/new recording. Stop, duration limits and
+normal stream end save completed recordings with the native container extension.
+Install requirements.txt for the m3u8 parser; FFmpeg is not required for recording.
 
 CREATOR SCOPE
 
@@ -96,35 +139,41 @@ Date filters use UTC and apply locally to posts, messages, purchases and stories
 
 FREE & TRIALS
 
-The Free & trials tab lists only offers that cost nothing. A page counts as free when
-its regular price is 0. A free trial is a 0 current price or a claimable 0 promotion on a
-paid page. Nothing above 0 is ever shown or acted on, so this tab cannot start a paid
-purchase and there is no purchase automation.
+The Free & trials tab lists zero-price candidates. A page counts as free when its
+profile price is 0. A trial candidate is a 0 current price, a claimable 0 promotion, or a
+shared trial link. Scanned prices are snapshots, not a guarantee of current eligibility.
 
 Scan sources: active subscriptions (also shows free/trial pages you already have),
-expired subscriptions, the newest messages of those chats (shared trial links), your
-inbox chat partners, your own custom lists, the promotion banners the website shows to
-your account, and an optional creator list you type in. There is no endpoint that
-enumerates every creator on the platform, so a platform-wide scan is not offered; inbox,
-lists and banners only cover creators who contacted you, are in your lists, or are
-advertised to your account. Chat scanning reads only the newest pages per chat, caps the
-number of chats, and skips a chat it cannot read. The inline progress bar and status
-line show which source is being read.
+expired subscriptions (their newest chat messages are searched too), the newest messages
+of those chats (shared trial links), your inbox chat partners, your own custom lists, the
+promotion banners the website shows to your account, and an optional creator list you
+type in. Deep scan raises the bounded limits for chat pages, chat partners, lists and list
+users. The search box filters loaded rows by creator, source or detail. No complete
+creator-directory endpoint has been verified for this client, so a platform-wide scan is
+not offered; inbox, lists and banners only cover creators who contacted you, are in your
+lists, or are advertised to your account. Chat scanning reads only the newest pages per
+chat, caps the number of chats, and skips a chat it cannot read. The inline progress bar
+and status line show which source is being read. Rows appear during the scan and survive
+cancellation or a later error. Unavailable optional sources are reported as incomplete;
+authentication failures and rate limits stop the scan while keeping partial rows.
 
-Already-subscribed rows are labelled and cannot be subscribed again. Claimed trial codes
-are remembered in free_trials.json with a hash only, so the same link is not claimed
-twice even after a restart. Free-page and trial actions are sent only after you select
-rows and confirm the dialog. Subscriptions happen on your real account: check renewal
-settings on the website afterwards.
+Claiming: select rows marked Ready to subscribe (free page) or Ready to claim (shared
+trial code), click Subscribe / claim selected, and confirm the warning. Free pages are
+re-read immediately before the POST and refused if they are no longer $0 or are already
+subscribed. Trial codes are claimed through the account's trial endpoint. Trial offers
+without a code stay website-only. A free trial normally renews automatically at the
+creator's regular monthly price unless cancelled on the website. A price change between
+the final check and the server's decision cannot be fully excluded. POSTs are never
+retried. Already-subscribed rows are read-only. Claimed codes are remembered as hashes
+(never plaintext) in free_trials.json, so the same link is not claimed twice.
 
 Paid promotions, paid offers and paid content purchases are never listed, claimed or
 started here. The tool does not buy anything and does not open a new paid subscription.
 Content you already paid for or already subscribe to stays downloadable through the
 normal Downloads tab (including the Purchased category); nothing about that changed.
 
-Free subscription uses the account's own subscribe endpoint; a shared trial link is
-claimed by its code. A trial offer with no code is informational and must be claimed on
-the website. Unsubscribing, paid renewals, and paid promotion claims are not automated.
+Unsubscribing, renewals and purchases are not automated. Downloads continue to read
+accessible content, including existing paid subscriptions and purchases.
 
 DUPLICATES
 
@@ -136,8 +185,10 @@ size and modification time. Symbolic links are ignored and non-media files are n
 Each group keeps one copy: the copy recorded in the download manifest when possible,
 otherwise the shortest path. Select a file row and use Use selected copy as keeper to
 change that. Delete other copies removes only the non-kept files, inside the chosen
-folder, after you confirm. Every extra copy is re-hashed immediately before deletion, so
-a file that changed meanwhile is skipped. Deletion bypasses the recycle bin.
+folder, after you confirm. Extra copies and the keeper are re-hashed before deletion.
+A missing, changed or unsafe keeper stops deletion for that group. Files changed during
+verification are skipped. Deletion bypasses the recycle bin. Avoid modifying the library
+from another application while cleanup runs.
 
 This report is local only. It does not change the download manifest and does not upload
 filenames or hashes anywhere.
@@ -243,7 +294,10 @@ class App:
         self.scan_lists = tk.BooleanVar(root,True)
         self.scan_promotions = tk.BooleanVar(root,True)
         self._offer_scanning = False
+        self._offer_warnings = 0
         self.offer_names = tk.StringVar(root,'')
+        self.offer_search = tk.StringVar(root,'')
+        self.deep_offers = tk.BooleanVar(root,False)
         self.offer_filter = tk.StringVar(root,'All offers')
         self.offer_status_filter = tk.StringVar(root,'All statuses')
         self.offer_status = tk.StringVar(root,'No scan yet. Choose sources and click Scan now.')
@@ -272,6 +326,7 @@ class App:
         self.skip_profiles.trace_add('write', self._update_creator_summary)
         self.date_mode.trace_add('write', self._sync_download_controls)
         self.offer_filter.trace_add('write', self._refresh_offer_tree)
+        self.offer_search.trace_add('write', self._refresh_offer_tree)
         self.offer_status_filter.trace_add('write', self._refresh_offer_tree)
         self._sync_download_controls()
         self._update_creator_summary()
@@ -398,11 +453,13 @@ class App:
         self.downloads_tab = ttk.Frame(self.tabs)
         self.offers_tab = ttk.Frame(self.tabs,padding=20)
         self.duplicates_tab = ttk.Frame(self.tabs,padding=20)
+        self.live_tab = LiveTab(self.tabs,self)
         self.activity_tab = ttk.Frame(self.tabs,padding=20)
         self.help_tab = ttk.Frame(self.tabs,padding=20)
         for frame,label in ((self.session_tab,'1  Session'),(self.downloads_tab,'2  Downloads'),
                             (self.offers_tab,'3  Free & trials'),(self.duplicates_tab,'4  Duplicates'),
-                            (self.activity_tab,'5  Activity'),(self.help_tab,'Help & privacy')):
+                            (self.live_tab,'5  Live recording'),(self.activity_tab,'6  Activity'),
+                            (self.help_tab,'Help & privacy')):
             self.tabs.add(frame,text=label)
         self.session_content,self.session_canvas = self._scrollable_content(self.session_tab)
         self.downloads_content,self.downloads_canvas = self._scrollable_content(self.downloads_tab)
@@ -600,68 +657,14 @@ class App:
         ttk.Label(row,text='Saves only nonsecret settings—not your session.',style='Muted.TLabel').pack(side='left',padx=12)
 
     def _offers_tab(self):
-        parent = self.offers_tab
-        ttk.Label(parent,text='Free subscriptions & free trials',style='Heading.TLabel').pack(anchor='w')
-        ttk.Label(parent,text='Only offers that cost nothing are listed. Paid prices are never shown or acted on, and nothing is subscribed until you confirm it.',
-                  style='Muted.TLabel',wraplength=900).pack(anchor='w',pady=(4,12))
-        sources = ttk.LabelFrame(parent,text='Scan sources',padding=12)
-        sources.pack(fill='x')
-        row = ttk.Frame(sources)
-        row.pack(fill='x')
-        ttk.Checkbutton(row,text='Active subscriptions',variable=self.scan_active).pack(side='left')
-        ttk.Checkbutton(row,text='Expired subscriptions',variable=self.scan_expired).pack(side='left',padx=(18,0))
-        ttk.Checkbutton(row,text='Newest chat messages (trial links)',variable=self.scan_messages).pack(side='left',padx=(18,0))
-        row = ttk.Frame(sources)
-        row.pack(fill='x',pady=(6,0))
-        ttk.Checkbutton(row,text='Inbox chat partners',variable=self.scan_inbox).pack(side='left')
-        ttk.Checkbutton(row,text='My custom lists',variable=self.scan_lists).pack(side='left',padx=(18,0))
-        ttk.Checkbutton(row,text='Website promo banners (0-price only)',variable=self.scan_promotions).pack(side='left',padx=(18,0))
-        ttk.Label(sources,text='Inbox, lists and website promos cover creators who contacted you, are in your lists, or are advertised to your account. There is no platform-wide creator list.',
-                  style='Muted.TLabel',wraplength=880).pack(anchor='w',pady=(6,0))
-        row = ttk.Frame(sources)
-        row.pack(fill='x',pady=(10,0))
-        ttk.Label(row,text='Also check creators').pack(side='left')
-        self.offer_names_entry = ttk.Entry(row,textvariable=self.offer_names)
-        self.offer_names_entry.pack(side='left',fill='x',expand=True,padx=(8,8))
-        self.button(row,'Scan now',self.scan_offers,accent=True,side='left')
-        ttk.Label(sources,text='Optional creator names or profile URLs, separated by commas. Active subscriptions are included so pages you already have appear read-only and cannot be subscribed twice.',
-                  style='Muted.TLabel',wraplength=880).pack(anchor='w',pady=(8,0))
-        ttk.Label(parent,textvariable=self.offer_status,style='Muted.TLabel',wraplength=900).pack(anchor='w',pady=(10,0))
-        self.offer_bar = ttk.Progressbar(parent,mode='indeterminate')
-        self.offer_bar.pack(fill='x',pady=(6,0))
-        filters = ttk.Frame(parent)
-        filters.pack(fill='x',pady=(10,0))
-        ttk.Label(filters,text='Show',style='Muted.TLabel').pack(side='left')
-        self.offer_filter_box = ttk.Combobox(filters,textvariable=self.offer_filter,state='readonly',width=13,
-                                            values=['All offers','Free only','Trials only'])
-        self.offer_filter_box.pack(side='left',padx=(8,14))
-        self.offer_state_box = ttk.Combobox(filters,textvariable=self.offer_status_filter,state='readonly',width=17,
-                                           values=['All statuses','Available only','Already subscribed'])
-        self.offer_state_box.pack(side='left')
-        self.offer_action_button = self.button(filters,'Subscribe selected',self.subscribe_selected,
-                                               accent=True,busy=True,side='right')
-        self.offer_action_button.state(['disabled'])
-        self.button(filters,'Open profile / link',self.open_offer_profile,busy=False,side='right',padx=(0,8))
-        table = ttk.Frame(parent)
-        table.pack(fill='both',expand=True,pady=(10,0))
-        columns = ('creator','kind','price','source','status','details')
-        self.offer_tree = ttk.Treeview(table,columns=columns,show='headings',selectmode='extended',height=12)
-        for column,label,width,anchor in (('creator','Creator',170,'w'),('kind','Type',90,'w'),
-                                          ('price','Price',70,'w'),('source','Found via',180,'w'),
-                                          ('status','Status',120,'w'),('details','Details',330,'w')):
-            self.offer_tree.heading(column,text=label,command=lambda name=column:self._sort_offers_by(name))
-            self.offer_tree.column(column,width=width,anchor=anchor,
-                                   stretch=column in {'creator','source','details'})
-        scrollbar = ttk.Scrollbar(table,orient='vertical',command=self.offer_tree.yview)
-        self.offer_tree.configure(yscrollcommand=scrollbar.set)
-        self.offer_tree.pack(side='left',fill='both',expand=True)
-        scrollbar.pack(side='right',fill='y')
-        self.offer_tree.bind('<<TreeviewSelect>>',self._offer_selection_changed)
-        bottom = ttk.Frame(parent)
-        bottom.pack(fill='x',pady=(8,0))
-        ttk.Label(bottom,textvariable=self.offer_summary,style='Muted.TLabel').pack(side='left')
-        ttk.Label(bottom,text='Actions are sent only for selected rows after confirmation. Check renewal settings on the website.',
-                  style='Muted.TLabel').pack(side='right')
+        view = self.offer_view = OffersTab(self.offers_tab,self)
+        view.pack(fill='both',expand=True)
+        self.offer_names_entry = view.names_entry
+        self.offer_filter_box = view.filter_box
+        self.offer_state_box = view.state_box
+        self.offer_action_button = view.action_button
+        self.offer_tree = view.tree
+        self.offer_bar = view.bar
 
     def _offer_sort_key(self, offer: Offer, column: str):
         return {'creator':offer.username.lower(),'kind':offer.label.lower(),'price':offer.price,
@@ -680,34 +683,41 @@ class App:
             return
         self._offer_refreshing = True
         try:
+            selection = self.offer_tree.selection()
             for item in self.offer_tree.get_children():
                 self.offer_tree.delete(item)
             kind = {'Free only':FREE,'Trials only':TRIAL}.get(self.offer_filter.get())
             status = self.offer_status_filter.get()
+            query = self.offer_search.get().strip().casefold().lstrip('@')
             rows: list[Offer] = []
             for offer in self.offers.values():
                 if kind and offer.kind != kind:
                     continue
-                if status == 'Available only' and not offer.actionable:
+                if status == 'Available only' and not offer.available:
                     continue
                 if status == 'Already subscribed' and offer.status != SUBSCRIBED:
+                    continue
+                if query and query not in f'{offer.username} {offer.source} {offer.detail}'.casefold():
                     continue
                 rows.append(offer)
             column, reverse = self.offer_sort
             rows.sort(key=lambda offer:self._offer_sort_key(offer,column),reverse=reverse)
             for offer in rows:
-                state = {SUBSCRIBED:'Subscribed',AVAILABLE:'Available'}.get(offer.status,'Claimed earlier')
-                if offer.kind == TRIAL and not offer.code and offer.status == AVAILABLE:
-                    state = 'Claim on website'
+                state = {SUBSCRIBED:'Subscribed',AVAILABLE:'Ready'}.get(offer.status,'Claimed earlier')
+                if offer.status == AVAILABLE:
+                    state = 'Ready to subscribe' if offer.kind == FREE else (
+                            'Ready to claim' if offer.code else 'Website only')
                 detail = offer.detail + (f' · {offer.reason}' if offer.reason else '')
                 tags = ('subscribed',) if offer.status == SUBSCRIBED else (
                        ('used',) if offer.status != AVAILABLE else ())
                 self.offer_tree.insert('', 'end', iid=offer.key, tags=tags,
                                        values=(f'@{offer.username}',offer.label,'Free',offer.source,state,detail))
-            actionable = sum(1 for offer in self.offers.values() if offer.actionable)
+            self.offer_tree.selection_set([key for key in selection if self.offer_tree.exists(key)])
+            available = sum(1 for offer in self.offers.values() if offer.available)
+            claimable = sum(1 for offer in self.offers.values() if offer.actionable)
             if self.offers:
                 self.offer_summary.set(f'Showing {len(rows)} of {len(self.offers)} · '
-                                       f'{actionable} actionable · {len(self.offers) - actionable} read-only')
+                                       f'{available} available · {claimable} claimable now')
             else:
                 self.offer_summary.set('No offers loaded yet.')
             self._offer_selection_changed()
@@ -743,25 +753,30 @@ class App:
         flags = {'include_active':self.scan_active.get(),'include_expired':self.scan_expired.get(),
                  'include_messages':self.scan_messages.get(),'include_inbox':self.scan_inbox.get(),
                  'include_lists':self.scan_lists.get(),
-                 'include_promotions':self.scan_promotions.get()}
+                 'include_promotions':self.scan_promotions.get(),
+                 'deep':self.deep_offers.get()}
         history = OfferHistory.load()
+        proxy = self.proxy.get().strip()
         self.tabs.select(self.offers_tab)
-        self.offer_status.set('Scan started · reading your subscriptions…')
+        self.offers.clear()
+        self._offer_warnings = 0
+        self._refresh_offer_tree()
+        self.offer_status.set('Scan started · checking the session…')
         self._offer_scanning = True
         self.offer_bar.start(12)
         def run(control,emit):
             def work(client):
                 return scan_offers(client,control,extra_profiles=extra,history=history,
                                    emit=emit,**flags)
-            return self._with_client(auth,source,control,emit,work)
+            return self._with_client(auth,source,control,emit,work,proxy)
         def done(offers):
             self._stop_offer_progress()
             self.offers = {offer.key:offer for offer in offers}
             self._refresh_offer_tree()
-            actionable = sum(1 for offer in offers if offer.actionable)
-            self.offer_status.set(f'Scan finished · {len(offers)} free/trial row(s) · '
-                                  f'{actionable} actionable · already-subscribed rows stay read-only.')
-            self.status.set('Free & trials scan finished')
+            state = 'Scan incomplete' if self._offer_warnings else 'Scan finished'
+            self.offer_status.set(f'{state} · {len(offers)} free/trial row(s) · '
+                                  f'{self._offer_warnings} source warning(s) · select claimable rows to subscribe.')
+            self.status.set(f'Free & trials: {state.lower()}')
         self.run_task('Scanning free & trial offers',run,done)
 
     def _stop_offer_progress(self):
@@ -777,53 +792,65 @@ class App:
             return
         offers = [offer for offer in self._selected_offers() if offer.actionable]
         if not offers:
-            messagebox.showinfo('Choose offers','Select at least one row marked Available. Already-subscribed rows and trial offers without a code cannot be acted on here.',
-                                parent=self.root)
-            return
-        lines = []
-        for offer in offers:
-            if offer.kind == FREE:
-                lines.append(f'• Free page · @{offer.username} (0 price)')
-            else:
-                lines.append(f'• Free trial · @{offer.username} (claim shared link)')
-        if not messagebox.askokcancel(
-                'Confirm free subscription / trial claim',
-                'These actions are sent to your real account now:\n\n' + '\n'.join(lines) +
-                '\n\nOnly zero-price offers are included. Check renewal settings on the website afterwards. Continue?',
-                parent=self.root):
+            messagebox.showinfo(
+                'Nothing claimable',
+                'Select rows marked Ready to subscribe or Ready to claim. Trial offers without '
+                'a shared code, paid pages and already subscribed rows stay website-only.',
+                parent=self.root)
             return
         try:
             auth = self.get_auth()
         except SessionError as exc:
             messagebox.showerror('Session needed',str(exc),parent=self.root)
             return
+        lines = [f'• {"Claim free trial" if offer.kind == TRIAL else "Subscribe free page"}: '
+                 f'@{offer.username}' for offer in offers[:12]]
+        if len(offers) > 12:
+            lines.append(f'• … and {len(offers) - 12} more')
+        warning = (
+            'This sends real account actions now:\n\n' + '\n'.join(lines) +
+            '\n\nOnly $0 offers are sent. Free pages are re-checked immediately before the request. '
+            'A free trial normally renews automatically at the creator\'s regular monthly price '
+            'unless you cancel it on the website. A price change between the final check and the '
+            'server decision cannot be fully excluded.\n\nContinue?')
+        if not messagebox.askyesno('Confirm subscriptions and trials',warning,parent=self.root,icon='warning'):
+            return
         source = self.rules_source.get().strip()
+        proxy = self.proxy.get().strip()
         history = OfferHistory.load()
+        self.offer_status.set(f'Sending {len(offers)} account action(s)…')
         def run(control,emit):
             def work(client):
-                messages: list[str] = []
-                failures: list[str] = []
+                results = []
                 for offer in offers:
                     control.checkpoint()
                     try:
-                        messages.append(claim_offer(client,offer,control,history,emit))
+                        results.append((offer, claim_offer(client, offer, control, history, emit), ''))
+                    except Cancelled:
+                        raise
+                    except ApiError as exc:
+                        if exc.status in {401,429}:
+                            results.append((offer, '', f'Session rejected or rate limited (HTTP {exc.status}); stopped sending.'))
+                            break
+                        results.append((offer, '', f'HTTP {exc.status}'))
                     except AppError as exc:
-                        failures.append(f'@{offer.username}: {exc}')
-                return messages,failures
-            return self._with_client(auth,source,control,emit,work)
-        def done(result):
-            messages,failures = result
+                        results.append((offer, '', str(exc)))
+                return results
+            return self._with_client(auth,source,control,emit,work,proxy)
+        def done(results):
             self._refresh_offer_tree()
-            if messages:
-                self.offer_status.set(' '.join(messages))
-                self.status.set('Free & trials action completed')
-            if failures:
-                for failure in failures:
-                    self.log(failure)
-                messagebox.showwarning('Some actions were not completed',
-                                       '\n'.join(failures) + '\n\nNothing was repeated for rows that already reported success.',
-                                       parent=self.root)
-        self.run_task('Subscribing to selected free offers',run,done)
+            claimed = sum(1 for _,message,_ in results if message)
+            problems = len(results) - claimed
+            for offer,message,error in results:
+                self.log(message if message else f'@{offer.username}: {error}')
+            self.offer_status.set(f'{claimed} claimed · {problems} not sent · review status in the table')
+            if problems:
+                detail = '\n'.join(f'@{offer.username}: {error}' for offer,_,error in results if error)
+
+                messagebox.showwarning('Some offers were not claimed',detail[:2000],parent=self.root)
+            else:
+                messagebox.showinfo('Offers claimed',f'{claimed} free subscription(s)/trial(s) completed.',parent=self.root)
+        self.run_task('Subscribing free pages and claiming trials',run,done)
 
     def open_offer_profile(self):
         offers = self._selected_offers()
@@ -833,40 +860,9 @@ class App:
         webbrowser.open(offers[0].url)
 
     def _duplicates_tab(self):
-        parent = self.duplicates_tab
-        ttk.Label(parent,text='Duplicate files in the library',style='Heading.TLabel').pack(anchor='w')
-        ttk.Label(parent,text='Compares file contents (SHA-256) inside one folder tree. Symbolic links are ignored, only media files are read, and nothing is deleted without confirmation.',
-                  style='Muted.TLabel',wraplength=900).pack(anchor='w',pady=(4,12))
-        folder = ttk.Frame(parent)
-        folder.pack(fill='x')
-        ttk.Label(folder,text='Library folder',width=14).pack(side='left')
-        ttk.Entry(folder,textvariable=self.duplicate_dir).pack(side='left',fill='x',expand=True)
-        self.button(folder,'Browse…',self.browse_duplicate_dir,side='left',padx=(8,0))
-        self.button(folder,'Scan for duplicates',self.scan_duplicates,accent=True,side='left',padx=(8,0))
-        ttk.Label(parent,textvariable=self.duplicate_status,style='Muted.TLabel',wraplength=900).pack(anchor='w',pady=(10,0))
-        table = ttk.Frame(parent)
-        table.pack(fill='both',expand=True,pady=(10,0))
-        columns = ('file','size','status')
-        self.duplicate_tree = ttk.Treeview(table,columns=columns,show='tree headings',
-                                           selectmode='extended',height=12)
-        self.duplicate_tree.heading('#0',text='Duplicate group / file')
-        self.duplicate_tree.column('#0',width=520,stretch=True)
-        for column,label,width in (('file','File',0),('size','Size',100),('status','Status',110)):
-            self.duplicate_tree.heading(column,text=label)
-            self.duplicate_tree.column(column,width=width,stretch=column == 'file',
-                                       anchor='e' if column != 'status' else 'w')
-        scrollbar = ttk.Scrollbar(table,orient='vertical',command=self.duplicate_tree.yview)
-        self.duplicate_tree.configure(yscrollcommand=scrollbar.set)
-        self.duplicate_tree.pack(side='left',fill='both',expand=True)
-        scrollbar.pack(side='right',fill='y')
-        actions = ttk.Frame(parent)
-        actions.pack(fill='x',pady=(10,0))
-        self.button(actions,'Use selected copy as keeper',self.keep_selected_duplicate,side='left')
-        self.button(actions,'Delete other copies',self.delete_duplicates,side='left',padx=(8,0))
-        self.button(actions,'Open folder',self.open_duplicate_folder,busy=False,side='left',padx=(8,0))
-        ttk.Label(parent,textvariable=self.duplicate_summary,style='Muted.TLabel').pack(anchor='w',pady=(8,0))
-        ttk.Label(parent,text='The keeper is chosen from the download manifest when possible, otherwise the shortest path. Deleting re-hashes each extra copy first, so changed files are skipped.',
-                  style='Muted.TLabel',wraplength=900).pack(anchor='w',pady=(4,0))
+        self.duplicate_view = DuplicatesTab(self.duplicates_tab,self)
+        self.duplicate_view.pack(fill='both',expand=True)
+        self.duplicate_tree = self.duplicate_view.tree
 
     def _refresh_duplicate_tree(self):
         if not hasattr(self,'duplicate_tree'):
@@ -1281,12 +1277,12 @@ class App:
         if not messagebox.askokcancel('Browser session helper','This opens an isolated temporary browser. Log into your own account and complete any normal verification. The app captures session headers locally and closes the helper browser.\n\nYour password is entered only on the website; it is not stored by this app. A blocked browser challenge is not bypassed. Continue?',parent=self.root):
             return
         channel = {'Chromium':'chromium','Google Chrome':'chrome','Microsoft Edge':'msedge'}[self.browser_channel.get()]
+        proxy = self.proxy.get().strip()
         self.run_task('Browser login',lambda control,emit:capture_session(control,channel=channel,emit=emit,
-                                                                          proxy=self.proxy.get().strip()),
+                                                                          proxy=proxy),
                       self.apply_credentials)
 
-    def _with_client(self,auth,source,control,emit,work):
-        proxy = self.proxy.get().strip()
+    def _with_client(self,auth,source,control,emit,work,proxy):
         rules = load_rules(source,control,emit=emit,proxy=proxy)
         with ApiClient(auth,rules,control,emit=emit,proxy=proxy) as client:
             return work(client)
@@ -1301,24 +1297,27 @@ class App:
             messagebox.showerror('Session needed',str(exc),parent=self.root)
             return
         source = self.rules_source.get().strip()
+        proxy = self.proxy.get().strip()
         self.session_status.set('Testing the imported session with the account endpoint · not ready yet')
         def accepted(user):
             try:
-                unchanged = self.get_auth() == auth and self.rules_source.get().strip() == source
+                unchanged = (self.get_auth() == auth and self.rules_source.get().strip() == source
+                             and self.proxy.get().strip() == proxy)
             except SessionError:
                 unchanged = False
             if not unchanged:
-                self.session_status.set('Session fields or rules source changed during the test · test again')
+                self.session_status.set('Session fields, rules source or proxy changed during the test · test again')
                 self.log('The result applies to earlier inputs. Current inputs were not validated; test again.')
                 return
             self.session_status.set('Session accepted by the account endpoint · ready to select downloads')
             self.log('Session test passed. Content availability is checked separately during the scan.')
-        self.run_task('Testing session',lambda control,emit:self._with_client(auth,source,control,emit,lambda client:client.user('me')),accepted)
+        self.run_task('Testing session',lambda control,emit:self._with_client(auth,source,control,emit,lambda client:client.user('me'),proxy),accepted)
 
     def refresh_rules(self):
         source = self.rules_source.get().strip()
+        proxy = self.proxy.get().strip()
         self.run_task('Refreshing public signing rules',lambda control,emit:load_rules(
-                          source,control,force=True,emit=emit,proxy=self.proxy.get().strip()),
+                          source,control,force=True,emit=emit,proxy=proxy),
                       lambda result:self.rules_status.set('Rules refreshed and schema-checked. Use Test session to check whether the platform accepts them.'))
 
     def save_keychain(self):
@@ -1382,6 +1381,7 @@ class App:
             messagebox.showerror('Check setup',str(exc),parent=self.root)
             return
         source = self.rules_source.get().strip()
+        proxy = self.proxy.get().strip()
         if not auto:
             self.tabs.select(self.activity_tab)
         try:
@@ -1389,16 +1389,17 @@ class App:
         except tk.TclError:
             pass
         self.pipeline_progress.configure(mode='determinate',value=0)
-        self.overall_progress.configure(value=0)
+        self.overall_progress.stop()
+        self.overall_progress.configure(mode='determinate',value=0)
         self.file_progress.configure(value=0)
         self.pipeline_started = 0.0
         self.pipeline_total = 0
         self.pipeline_status.set('Overall progress: starting…')
         self.overall_status.set('Files: discovering…')
-        self.file_status.set('Discovering media before building the download queue')
+        self.file_status.set('Discovering media; downloads start as files are found')
         self.stats.set('Starting a new scan…')
         def run(control,emit):
-            return self._with_client(auth,source,control,emit,lambda client:run_downloads(client,options,control,emit))
+            return self._with_client(auth,source,control,emit,lambda client:run_downloads(client,options,control,emit),proxy)
         def completed(summary):
             if summary.errors:
                 self.status.set('Finished with issues · check the activity log')
@@ -1441,6 +1442,7 @@ class App:
 
     def _poll(self):
         self.poll_id = None
+        offers_dirty = False
         for _ in range(250):
             try:
                 kind,value = self.events.get_nowait()
@@ -1460,6 +1462,15 @@ class App:
                 total = int(value.get('total',0) or 0)
                 done = int(value.get('done',0) or 0)
                 self.duplicate_status.set(f'Hashing equal-size files… {done}/{total} · {value.get("file","")}')
+            elif kind == 'offer_row':
+                removed = value.get('remove')
+                if removed:
+                    self.offers.pop(removed,None)
+                offer = value['offer']
+                self.offers[offer.key] = offer
+                offers_dirty = True
+            elif kind == 'offer_warning':
+                self._offer_warnings += 1
             elif kind == 'offer_progress':
                 labels = {'subscriptions':'Reading subscriptions','inbox':'Reading inbox',
                           'lists':'Reading custom lists','profiles':'Checking creator profiles',
@@ -1482,20 +1493,33 @@ class App:
                     self.pipeline_progress.configure(mode='indeterminate')
                     self.pipeline_progress.start(15)
                     self.pipeline_status.set('Overall progress: discovering creators and paging new content…')
-                    self.overall_status.set('Files: waiting for discovery to finish')
-                elif stage == 'download':
+                    self.overall_status.set('Files: discovering the first candidates')
+                elif stage == 'streaming':
                     self.pipeline_started = time.monotonic()
+                    self.pipeline_status.set('Scanning and downloading · total still growing')
+                    self.pipeline_progress.configure(mode='indeterminate')
+                    self.pipeline_progress.start(15)
+                elif stage == 'download':
+                    if not self.pipeline_started:
+                        self.pipeline_started = time.monotonic()
                     self.pipeline_total = int(value.get('total',0))
                     self.pipeline_progress.stop()
                     self.pipeline_progress.configure(mode='determinate',value=0)
                     self.pipeline_status.set(f'Overall progress: download queue ready · 0/{self.pipeline_total} files · ETA estimating…')
                 elif stage == 'done':
                     self.pipeline_progress.stop()
+                    self.overall_progress.stop()
                     self.pipeline_progress.configure(mode='determinate',value=100)
                     self.pipeline_status.set('Overall progress: finished')
             elif kind == 'overall':
                 total = max(1,value['total'])
                 done = value['done']
+                if value.get('scanning'):
+                    self.overall_status.set(f"Files: {done} processed · {value['total']} found so far · {max(0,value['total']-done)} pending")
+                    self.pipeline_status.set('Scanning and downloading · final total and ETA available after discovery')
+                    continue
+                self.overall_progress.stop()
+                self.overall_progress.configure(mode='determinate')
                 self.overall_progress.configure(value=100*done/total)
                 self.overall_status.set(f"Files: {done}/{value['total']} complete")
                 if self.pipeline_started:
@@ -1521,7 +1545,7 @@ class App:
                     self.session_status.set('Session test stopped · not ready; test again before downloading')
                 if self._offer_scanning:
                     self._stop_offer_progress()
-                    self.offer_status.set('Scan stopped · showing the rows found so far')
+                    self.offer_status.set(f'Scan stopped · {len(self.offers)} partial row(s) kept · {self._offer_warnings} source warning(s)')
                 self.status.set('Stopped')
                 self.log(value)
             elif kind == 'error':
@@ -1529,12 +1553,14 @@ class App:
                     self.session_status.set('Session test failed · not ready; see the safe diagnostic in Activity')
                 if self._offer_scanning:
                     self._stop_offer_progress()
-                    self.offer_status.set('Scan failed · see the activity log')
+                    self.offer_status.set(f'Scan failed · {len(self.offers)} partial row(s) kept · see the activity log')
                 self.status.set('Operation failed · check the activity log')
                 self.log(value)
                 if not self.closing and not self.task_quiet:
                     messagebox.showerror('Operation failed',value,parent=self.root)
             elif kind == 'done':
+                self.pipeline_progress.stop()
+                self.overall_progress.stop()
                 self.worker = None
                 self.success_callback = None
                 self.task_title = ''
@@ -1548,16 +1574,21 @@ class App:
                 self.pause_button.configure(text='Pause')
                 if self.task_title == '' and self._auto_check_id is None:
                     self._reschedule_auto_check()
-                if self.closing:
+                if self.closing and not self.live_tab.running:
                     self.root.destroy()
                     return
+        if offers_dirty:
+            self._refresh_offer_tree()
+        if self.closing and self.worker is None and not self.live_tab.running:
+            self.root.destroy()
+            return
         if self.root.winfo_exists():
             self.poll_id = self.root.after(80,self._poll)
 
     def update_stats(self,values):
         drm = values.get('drm',0)
-        self.stats.set(f"Queued: {values['planned']}  ·  Downloaded: {values['downloaded']}  ·  Existing: {values['existing']}  ·  Duplicates: {values['duplicates']}\n"
-                       f"Filtered: {values['filtered']}  ·  Unavailable / unsupported: {values['unavailable']}  ·  DRM-protected (skipped): {drm}  ·  Issues: {values['errors']}  ·  Transferred on completed files: {readable_bytes(values['transferred_bytes'])}")
+        self.stats.set(f"Found: {values['planned']}  ·  Downloaded: {values['downloaded']}  ·  Existing: {values['existing']}  ·  Duplicates: {values['duplicates']}\n"
+                       f"Filtered: {values['filtered']}  ·  Unavailable: {values['unavailable']}  ·  DRM-protected (skipped): {drm}  ·  Unsupported streaming: {values.get('streaming',0)}  ·  Issues: {values['errors']}  ·  Transferred on completed files: {readable_bytes(values['transferred_bytes'])}")
 
     def log(self,text: str):
         stamp = datetime.now().strftime('%H:%M:%S')
@@ -1601,9 +1632,10 @@ class App:
             except tk.TclError:
                 pass
             self._auto_check_id = None
-        if self.worker:
+        if self.worker or self.live_tab.running:
             self.closing = True
             self.stop()
+            self.live_tab.stop()
         else:
             self.root.destroy()
 
@@ -1656,7 +1688,8 @@ class App:
         if not value:
             return ''
         try:
-            if urlsplit(value).username:
+            parsed = urlsplit(value)
+            if parsed.username is not None or parsed.password is not None:
                 return ''
         except ValueError:
             return ''
@@ -1672,12 +1705,14 @@ class App:
                   'auto_check':self.auto_check.get(), 'auto_check_interval':self.auto_check_interval.get(),
                   'scan_active':self.scan_active.get(), 'scan_expired':self.scan_expired.get(),
                   'scan_messages':self.scan_messages.get(), 'offer_names':self.offer_names.get(),
+                  'offer_search':self.offer_search.get(), 'deep_offers':self.deep_offers.get(),
                   'scan_inbox':self.scan_inbox.get(), 'scan_lists':self.scan_lists.get(),
                   'scan_promotions':self.scan_promotions.get(),
                   'offer_filter':self.offer_filter.get(),
                   'offer_status_filter':self.offer_status_filter.get(),
                   'duplicate_dir':self.duplicate_dir.get(),'proxy':self._persistable_proxy()}
         values.update({name:var.get() for name,var in self.flags.items()})
+        values.update(self.live_tab.preference_values())
         return values
 
     def _persist_silently(self):
@@ -1782,6 +1817,8 @@ class App:
             if isinstance(values.get(name),bool):
                 var.set(values[name])
         self.offer_names.set(str(values.get('offer_names','')))
+        self.offer_search.set(str(values.get('offer_search','')))
+        self.deep_offers.set(values.get('deep_offers') is True)
         if values.get('offer_filter') in {'All offers','Free only','Trials only'}:
             self.offer_filter.set(values['offer_filter'])
         if values.get('offer_status_filter') in {'All statuses','Available only','Already subscribed'}:
@@ -1791,6 +1828,7 @@ class App:
         else:
             self.duplicate_dir.set(self.output_dir.get())
         self.proxy.set(str(values.get('proxy','')))
+        self.live_tab.load_preferences(values)
         self._apply_theme()
         self._sync_download_controls()
         self._update_creator_summary()

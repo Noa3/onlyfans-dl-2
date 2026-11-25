@@ -45,7 +45,8 @@ def cli_main(args: argparse.Namespace) -> int:
         if kind in {'log','phase'}:
             print(value,flush=True)
         elif kind == 'overall':
-            print(f"Processed {value['done']}/{value['total']} files",flush=True)
+            suffix = ' found so far; discovery continues' if value.get('scanning') else ''
+            print(f"Processed {value['done']}/{value['total']} files{suffix}",flush=True)
     try:
         if args.refresh_rules:
             load_rules(args.rules,control,force=True,emit=emit,proxy=args.proxy)
@@ -89,7 +90,7 @@ def cli_main(args: argparse.Namespace) -> int:
             summary = run_downloads(client,options,control,emit)
         print(f'Downloaded: {summary.downloaded}; existing: {summary.existing}; planned: {summary.planned}; '
               f'filtered: {summary.filtered}; unavailable: {summary.unavailable}; DRM skipped: {summary.drm}; '
-              f'issues: {summary.errors}.')
+              f'unsupported streaming: {summary.streaming}; issues: {summary.errors}.')
         return 2 if summary.errors else 0
     except (KeyboardInterrupt,Cancelled):
         control.stop()

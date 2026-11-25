@@ -291,9 +291,9 @@ class ApiClient:
     def post(self, endpoint: str, payload: Mapping[str, Any] | None = None) -> Any:
         """Signed POST with a JSON body.
 
-        Used only by the explicit free-subscription / trial-claim actions the
-        user confirms in the Free & trials tab. This client never starts a
-        purchase or a paid subscription on its own.
+        Low-level helper, never automatically retried. Subscription and trial
+        workflows remain disabled in offers.py until a server-enforced
+        zero-price contract is verified.
         """
         return self._request('POST', endpoint, payload=dict(payload or {}))
 
@@ -303,7 +303,10 @@ class ApiClient:
                 or any(char in endpoint for char in '?\\#\r\n')
                 or any(part in {'.','..'} for part in unquote(endpoint).split('/'))):
             raise AppError('Refused an invalid API endpoint.')
-        for attempt in range(self.retries + 1):
+        # A lost response does not mean a write was not applied by the server.
+        # Only reads are safe to retry without an idempotency contract.
+        retries = self.retries if method == 'GET' else 0
+        for attempt in range(retries + 1):
             self.control.checkpoint()
             self.control.wait(max(0.0, self.last_request + self.interval - time.monotonic()))
             headers = dict(BROWSER_HEADERS)
@@ -333,7 +336,7 @@ class ApiClient:
                                                allow_redirects=False, stream=True)
                 status = response.status_code
                 if status == 429 or 500 <= status <= 599:
-                    if attempt >= self.retries:
+                    if attempt >= retries:
                         raise self._api_error(response, prepared)
                     header = response.headers.get('Retry-After')
                 elif status != 200:
@@ -350,7 +353,9 @@ class ApiClient:
             except NETWORK_ERRORS as exc:
                 if 'ssl' in str(exc).lower() or 'certificate' in str(exc).lower():
                     raise AppError('TLS certificate verification failed. Check your clock and certificate setup; verification is still enabled.') from None
-                if attempt >= self.retries:
+                if method != 'GET':
+                    raise AppError('The API action has an unknown outcome and was not retried. Check the account on the website before trying again.') from None
+                if attempt >= retries:
                     raise AppError('The API connection failed or timed out after its retry limit.') from None
                 header = None
             finally:
