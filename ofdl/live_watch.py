@@ -16,6 +16,7 @@ from .api import ApiClient, ApiError, load_rules
 from .common import AppError, Cancelled, Control, no_events
 from .downloads import parse_profiles
 from .http import playwright_proxy
+from .paths import local_output_path
 
 
 @dataclass(frozen=True)
@@ -51,7 +52,7 @@ class WatchOptions:
         parse_profiles(self.include)
         parse_profiles(self.exclude)
         playwright_proxy(self.proxy)
-        self.output_dir = Path(self.output_dir).expanduser().resolve()
+        self.output_dir = local_output_path(self.output_dir)
         return self
 
 

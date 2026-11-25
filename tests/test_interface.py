@@ -516,6 +516,24 @@ class UITests(unittest.TestCase):
         self.assertTrue(load_preferences(self.app.preferences_path).get('autoload_session'))
         self.app.autoload_session.set(False)
 
+    def test_save_session_also_persists_output_folder(self):
+        from ofdl.settings import save_preferences
+        self.app.apply_credentials(Credentials('123','UA','bc','session-value'))
+        save_preferences({'theme':'dark'}, self.app.preferences_path)
+        self.app.output_dir.set('/tmp/onlyfans-output')
+        def run_inline(title, work, success=None, *, quiet=False):
+            result = work(None, None)
+            if success:
+                success(result)
+        with patch('ofdl.ui.save_session') as saver, patch.object(self.app, 'run_task',
+                                                                  side_effect=run_inline):
+            self.app.save_keychain()
+        saver.assert_called_once()
+        saved = load_preferences(self.app.preferences_path)
+        self.assertEqual(saved.get('output_dir'), '/tmp/onlyfans-output')
+        self.assertEqual(saved.get('theme'), 'dark', 'unrelated preferences are preserved')
+        self.assertNotIn('session-value', self.app.preferences_path.read_text(encoding='utf-8'))
+
     def test_proxy_credentials_are_never_written_to_preferences(self):
         for url in ('http://user:secret@127.0.0.1:8080',
                     'http://:secret@127.0.0.1:8080',

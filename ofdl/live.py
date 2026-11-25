@@ -18,6 +18,7 @@ import requests
 from .common import AppError, Cancelled, Control, EventSink, no_events
 from .downloads import safe_component, safe_path, validate_media_url
 from .http import proxy_mapping
+from .paths import local_output_path
 
 MAX_PLAYLIST_BYTES = 2 * 1024 * 1024
 MAX_SEGMENT_BYTES = 64 * 1024 * 1024
@@ -35,7 +36,7 @@ class LiveOptions:
 
     def validate(self):
         validate_media_url(self.url)
-        self.output_dir = Path(self.output_dir).expanduser().resolve()
+        self.output_dir = local_output_path(self.output_dir)
         self.label = safe_component(self.label or 'live')[:80]
         if not 0 <= self.max_seconds <= 7 * 24 * 3600:
             raise AppError('Recording duration must be between 0 and 7 days (0 means until stopped).')

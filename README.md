@@ -1,4 +1,4 @@
-# OnlyFans DL — Desktop 2.8.0
+# OnlyFans DL — Desktop 2.8.1
 
 <img width="706" height="597" alt="grafik" src="https://github.com/user-attachments/assets/c5273233-e35f-4e3e-864f-98f5b79bc7e3" /><img width="703" height="595" alt="grafik" src="https://github.com/user-attachments/assets/6e27fac5-858b-46a5-8734-364618beb937" />
 
@@ -16,6 +16,20 @@ challenges.
 
 **Extract the entire folder.** Keep `onlyfans-dl.py`, the `ofdl/` package, and the
 other files together. The launcher is not a standalone replacement file.
+
+## What's new in 2.8.1
+
+- **Use your existing Firefox login.** `import_firefox_session.py` reads the
+  logged-in `onlyfans.com` session from your own Firefox profile and stores it in
+  the OS credential store. Nothing is printed or saved in plaintext. Then use
+  **Load saved session** in the GUI or `--use-keyring` in the CLI.
+- **Network folders work as output.** `smb://host/share/…` is resolved through
+  KIO-FUSE on KDE using your saved Dolphin/KWallet credentials. Elsewhere mount the
+  share and choose the mounted folder. Web and unknown URL schemes now fail with a
+  clear message instead of a generic `OSError`.
+- **One save button for session and folder.** **Save session securely** also stores
+  the current output folder in the nonsecret preferences, so a network folder is
+  restored on the next start.
 
 ## What's new in 2.8.0
 
@@ -250,6 +264,12 @@ libraries; `.venv/bin/python -m playwright install-deps chromium` installs them 
 supported distributions (and may request privileges) — the supplied installer does not
 run that automatically.
 
+**Network shares:** `smb://host/share` is a browser URL, not a filesystem path. On KDE
+the output folder is resolved through KIO-FUSE automatically (the share must be
+accessible with your saved credentials). Elsewhere, mount the share with your operating
+system or file manager and choose the mounted folder, for example
+`/mnt/nas/Onlyfans`.
+
 The launch scripts do not request administrator privileges. Their Windows execution was
 not tested in the Linux build environment.
 
@@ -283,6 +303,22 @@ preserves additional cookies in that request. Your numeric ID can be recovered f
 `auth_id` cookie when the `user-id` header is absent. **The pasted command is parsed as
 text, never executed.** Raw headers, session JSON, and JSON/HAR files are also supported;
 sanitized HAR exports may omit cookies and cannot supply a complete session.
+
+### Method C — Reuse an existing Firefox login
+
+If you are already logged into `onlyfans.com` in Firefox, the included importer reads
+the `sess`/`auth_id` cookies and the `bcTokenSha` (`x-bc`) value from that profile and
+stores the session in the OS credential store:
+
+```bash
+.venv/bin/python import_firefox_session.py --dry-run   # check first
+.venv/bin/python import_firefox_session.py             # save
+```
+
+Then click **Load saved** on the Session tab (or enable automatic loading). Secret
+values are never printed or written to disk; the profile is read through temporary
+copies, so a running Firefox is fine. Re-run it after logging out, after the session
+expires, or after a major Firefox update.
 
 Manual entry remains available. Use only the `sess` cookie's value in `SESS_COOKIE`, not
 the whole Cookie header. `USER_ID` is your account ID, not the target creator's. Keep all

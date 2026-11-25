@@ -1320,14 +1320,32 @@ class App:
                           source,control,force=True,emit=emit,proxy=proxy),
                       lambda result:self.rules_status.set('Rules refreshed and schema-checked. Use Test session to check whether the platform accepts them.'))
 
+    def _save_output_folder(self) -> bool:
+        """Persist the output folder next to the other nonsecret preferences."""
+        try:
+            values = load_preferences(self.preferences_path)
+        except ValueError:
+            values = {}
+        values['output_dir'] = self.output_dir.get()
+        try:
+            save_preferences(values, self.preferences_path)
+        except OSError:
+            return False
+        return True
+
     def save_keychain(self):
         try:
             auth = self.get_auth()
         except SessionError as exc:
             messagebox.showerror('Session needed',str(exc),parent=self.root)
             return
-        self.run_task('Saving to OS credential store',lambda control,emit:save_session(auth),
-                      lambda result:self.session_status.set('Session saved in the supported OS credential store. Use Load saved on your next visit.'))
+        folder_saved = self._save_output_folder()
+        def saved(result):
+            extra = (' The output folder was saved too.' if folder_saved else
+                     ' The output folder could not be saved; use Save preferences to retry.')
+            self.session_status.set('Session saved in the supported OS credential store.' + extra
+                                    + ' Use Load saved on your next visit.')
+        self.run_task('Saving to OS credential store',lambda control,emit:save_session(auth),saved)
 
     def load_keychain(self):
         self.run_task('Loading from OS credential store',lambda control,emit:load_session(),self.apply_credentials)

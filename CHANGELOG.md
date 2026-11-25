@@ -1,5 +1,28 @@
 # Changes from the supplied onlyfans-dl.py
 
+## Desktop 2.8.1 — 2026-11-25 — Firefox session import and network output folders
+
+- Add `import_firefox_session.py`: reads the already logged-in `onlyfans.com`
+  session from a local Firefox profile (`sess`/`auth_id` cookies and the
+  `bcTokenSha` localStorage value used for `x-bc`), derives the user agent from
+  that profile's Firefox version, and stores the result in the OS credential
+  store. Secret values are never printed or written to disk; `--dry-run` only
+  checks that a session can be read. Useful when the fresh-browser helper is
+  inconvenient or asks for another login.
+- Accept browser-style network folders such as `smb://host/share` as the output
+  folder. On KDE they are resolved through KIO-FUSE with the credentials already
+  stored by Dolphin/KWallet, so downloads and live recordings can write directly
+  to an SMB share. Web and unknown URL schemes are rejected with an actionable
+  message instead of a generic `OSError`; plain local paths behave as before.
+- Apply the same output-folder resolution to Downloads, manual live recording and
+  automatic live monitoring. Add path-resolution tests, including the
+  `pathlib`-mangled `smb:/...` form produced by the GUI.
+- **Save session securely** now also persists the output folder with the other
+  nonsecret preferences, so a network folder does not have to be re-entered after
+  a restart. Unrelated saved preferences are preserved and credentials are still
+  never written to `settings.json`.
+- Document the KIO-FUSE behavior and the Arch/CachyOS `tk` package in the README.
+
 ## Desktop 2.8.0 — 2026-10-22 — free/trial claims and deeper discovery
 
 - Re-enable **Subscribe / claim selected** for zero-price offers after explicit

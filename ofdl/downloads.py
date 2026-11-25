@@ -18,6 +18,7 @@ import requests
 from .api import ApiClient, ApiError, TIMEOUT, wait_retry
 from .common import AppError, Cancelled, Control, EventSink, no_events
 from .http import normalize_proxy, proxy_mapping
+from .paths import local_output_path
 from .settings import atomic_json
 from .pipeline import BoundedWorker
 
@@ -114,7 +115,7 @@ class Options:
     skip_profiles: tuple[str, ...] = ()
 
     def validate(self) -> Options:
-        self.output_dir = Path(self.output_dir).expanduser().resolve()
+        self.output_dir = local_output_path(self.output_dir)
         self.skip_profiles = tuple(parse_profiles(' '.join(self.skip_profiles)))
         self.profiles = [] if self.all_subscriptions else parse_profiles(' '.join(self.profiles))
         if not self.all_subscriptions:
